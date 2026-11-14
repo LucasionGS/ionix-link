@@ -12,6 +12,8 @@ STRUCTURE.md                   This file
 README.md                      For users
 Makefile                       Installs the desktop side (daemon, unit, licence)
 PKGBUILD, packaging/aur/       ionix-link-git, same scheme as ionix-quickshell (r<count>.<hash>)
+assets/ionix-logo.svg          The Ionix logo (copy of ionix-iso's system/assets), source of the app icons
+scripts/make-app-icons.sh      Renders the launcher icons and splash PNGs into app/android/.../res (needs rsvg-convert)
 app/                           Flutter app (android + linux), package ionix_link
   lib/main.dart                Startup order only
   lib/link/                    Layer 1: connection core, no widgets

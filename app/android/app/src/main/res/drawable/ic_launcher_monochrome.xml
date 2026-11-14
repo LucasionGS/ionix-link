@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Ionix logo's outline as one shape, the eye cut out (evenodd), on the adaptive icon's 108dp
+     canvas: scaled so the diamond is 64dp tall like the coloured foreground. Path data is
+     assets/ionix-logo.svg's. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <group
+        android:pivotX="256"
+        android:pivotY="256"
+        android:scaleX="0.6667"
+        android:scaleY="0.6667">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:fillType="evenOdd"
+            android:pathData="M256.0,28.0L202.7,112.4L224.0,176.7L173.9,256.0L221.5,331.4L213.7,348.6L155.2,256.0L198.5,187.4L192.6,128.3L112.0,256.0L256.0,484.0L309.3,399.6L288.0,335.3L338.1,256.0L290.5,180.6L298.3,163.4L356.8,256.0L313.5,324.6L319.4,383.7L400.0,256.0L256.0,28.0ZM256.0,192.2L296.3,256.0L256.0,319.8L215.7,256.0Z" />
+    </group>
+</vector>

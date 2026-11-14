@@ -42,6 +42,10 @@
             android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
             android:foregroundServiceType="connectedDevice"
             android:exported="false"/>
+        <!-- The keep-alive notification's small icon, which flutter_foreground_task looks up by this name. -->
+        <meta-data
+            android:name="dev.ionnet.ionix_link.NOTIFICATION_ICON"
+            android:resource="@drawable/ic_stat_ionix" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

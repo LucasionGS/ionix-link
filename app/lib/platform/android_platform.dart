@@ -36,7 +36,7 @@ class AndroidPlatform extends LinkPlatform {
   static const int _serviceId = 4710;
   static const String _desktopChannel = "desktop";
   static const String _messagesChannel = "messages";
-  static const String _launcherIcon = "@mipmap/ic_launcher";
+  static const String _notificationIcon = "@drawable/ic_stat_ionix";
 
   final FlutterLocalNotificationsPlugin _notifications = FlutterLocalNotificationsPlugin();
   final bp.Battery _battery = bp.Battery();
@@ -60,7 +60,7 @@ class AndroidPlatform extends LinkPlatform {
         allowWifiLock: true,
       ),
     );
-    await _notifications.initialize(settings: const InitializationSettings(android: AndroidInitializationSettings(_launcherIcon)));
+    await _notifications.initialize(settings: const InitializationSettings(android: AndroidInitializationSettings(_notificationIcon)));
     final android = _notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
     await android?.createNotificationChannel(const AndroidNotificationChannel(_desktopChannel, "Desktop notifications", description: "Notifications mirrored from your desktop.", importance: Importance.high));
     await android?.createNotificationChannel(const AndroidNotificationChannel(_messagesChannel, "Messages", description: "Pings and clipboard text sent from your desktop."));
@@ -88,6 +88,7 @@ class AndroidPlatform extends LinkPlatform {
       serviceTypes: [ForegroundServiceTypes.connectedDevice],
       notificationTitle: title,
       notificationText: text,
+      notificationIcon: const NotificationIcon(metaDataName: "dev.ionnet.ionix_link.NOTIFICATION_ICON"),
       callback: linkKeepAliveCallback,
     );
     if (result is ServiceRequestFailure) debugPrint("Could not start the keep-alive service: ${result.error}");
@@ -117,7 +118,7 @@ class AndroidPlatform extends LinkPlatform {
           _desktopChannel,
           "Desktop notifications",
           channelDescription: "Notifications mirrored from your desktop.",
-          icon: _launcherIcon,
+          icon: _notificationIcon,
           subText: notification.app.isEmpty ? hostName : "${notification.app} · $hostName",
           importance: critical ? Importance.max : (low ? Importance.low : Importance.high),
           priority: critical ? Priority.max : (low ? Priority.low : Priority.high),
@@ -138,7 +139,7 @@ class AndroidPlatform extends LinkPlatform {
       title: title,
       body: body,
       notificationDetails: const NotificationDetails(
-        android: AndroidNotificationDetails(_messagesChannel, "Messages", channelDescription: "Pings and clipboard text sent from your desktop.", icon: _launcherIcon),
+        android: AndroidNotificationDetails(_messagesChannel, "Messages", channelDescription: "Pings and clipboard text sent from your desktop.", icon: _notificationIcon),
       ),
     );
   }
