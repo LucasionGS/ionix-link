@@ -1,0 +1,73 @@
+import "dart:async";
+import "dart:io";
+
+import "package:flutter/foundation.dart";
+import "package:flutter/services.dart";
+
+import "../link/link.dart";
+import "link_platform.dart";
+
+/// [LinkPlatform] for anything that is not Android (the Linux build, used to run the UI on a desktop): no service,
+/// notifications go to the debug log, no battery, no sound, clipboard through Flutter's `Clipboard`.
+class FallbackPlatform extends LinkPlatform {
+  final ValueNotifier<bool> _ringing = ValueNotifier(false);
+  Timer? _ringTimer;
+
+  @override
+  Future<void> init() async {}
+
+  @override
+  Future<PlatformDevice> device() async => PlatformDevice(name: Platform.localHostname, model: "Linux");
+
+  @override
+  bool get canScanQr => false;
+
+  @override
+  Future<void> startKeepAlive({required String title, required String text}) async => debugPrint("keep-alive: $title, $text");
+
+  @override
+  Future<void> stopKeepAlive() async => debugPrint("keep-alive: stopped");
+
+  @override
+  Future<bool> requestNotificationPermission() async => true;
+
+  @override
+  Future<void> showDesktopNotification(DesktopNotification notification, {required String hostName}) async {
+    debugPrint("notification from $hostName: ${notification.app}: ${notification.summary}");
+  }
+
+  @override
+  Future<void> cancelDesktopNotification(int id) async {}
+
+  @override
+  Future<void> showMessage(String title, String body) async => debugPrint("message: $title: $body");
+
+  @override
+  Future<BatteryState?> battery() async => null;
+
+  @override
+  Stream<BatteryState> get batteryChanges => const Stream.empty();
+
+  @override
+  Future<void> ring({Duration timeout = const Duration(seconds: 30)}) async {
+    debugPrint("ring (no sound on this platform)");
+    _ringing.value = true;
+    _ringTimer?.cancel();
+    _ringTimer = Timer(timeout, stopRinging);
+  }
+
+  @override
+  Future<void> stopRinging() async {
+    _ringTimer?.cancel();
+    _ringing.value = false;
+  }
+
+  @override
+  ValueListenable<bool> get ringing => _ringing;
+
+  @override
+  Future<void> setClipboard(String text) => Clipboard.setData(ClipboardData(text: text));
+
+  @override
+  Future<String> getClipboard() async => (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? "";
+}

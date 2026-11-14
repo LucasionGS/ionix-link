@@ -1,0 +1,4377 @@
+#!/usr/bin/env python3
+"""ionix-link — the desktop side of Ionix Link, the phone companion.
+
+One file, stdlib only, two roles:
+
+    ionix-link daemon   Long-running (systemd/ionix-link.service). Serves paired
+                        phones over TLS on TCP 47110, answers UDP discovery on
+                        47110, and takes CLI requests on a unix socket.
+    ionix-link <cmd>    Everything else is a thin client of that socket.
+
+The wire protocol is PROTOCOL.md at the repository root; this file follows it
+and does not restate it. Section numbers below (§5) point there.
+
+What the daemon does for a phone is done by *plugins*, one class each below,
+listed in PLUGINS. A plugin names the tools it needs (`grim`, `wtype`,
+`playerctl`...); one whose tools are missing is simply not offered in `ready`,
+so the phone never shows a tile that cannot work. Adding a plugin means one
+`Plugin` subclass and one entry in PLUGINS (and the phone-side client).
+
+Nothing here talks to a desktop service through a library. It shells out:
+busctl (notifications), playerctl, wpctl/pactl (media), wl-copy/wl-paste,
+wtype, grim, hyprctl or wlr-randr, notify-send, qrencode, awww, magick or
+ffmpeg, and openssl. The one exception is the pointer: a small Wayland client
+speaking zwlr_virtual_pointer_v1 over the compositor socket, because no CLI
+tool moves a pointer relatively at touchpad rates without a process per event.
+
+Files (§10; every path has an environment override for testing in a scratch dir):
+
+    $XDG_DATA_HOME/ionix/link/       host.json, cert.pem, key.pem, devices.json (0600)
+    $XDG_STATE_HOME/ionix/link/      state.json, for the desktop shell to read
+    $XDG_CONFIG_HOME/ionix/link/     config.json, commands.json (the user's)
+    $XDG_RUNTIME_DIR/ionix-link.sock the control socket (§9)
+
+Concurrency: a single asyncio event loop. TLS server, UDP endpoint, control
+socket and every tool subprocess are asyncio objects; nothing blocks the loop
+(no subprocess.run, no time.sleep). Writes to one connection go through its
+own lock so a screen frame and a reply never interleave.
+"""
+
+import asyncio
+import copy
+import glob
+import hashlib
+import hmac
+import html
+import ipaddress
+import json
+import math
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import urllib.parse
+
+VERSION = "0.1.0"
+
+# ── Protocol constants (PROTOCOL.md) ───────────────────────────────────────
+
+PROTOCOL = 1                       # highest protocol version spoken
+PROTOCOL_MIN = 1                   # lowest protocol version spoken
+URI_VERSION = 1                    # `v` of the pairing URI
+DEFAULT_PORT = 47110               # TCP and UDP
+
+KIND_JSON = 0
+KIND_BINARY = 1
+
+MAX_FRAME_UNAUTH = 64 * 1024       # frame `length` before `ready`
+MAX_FRAME = 8 * 1024 * 1024        # frame `length` after `ready`
+MAX_JSON = 1024 * 1024             # one JSON message
+MAX_TEXT = 512 * 1024              # clipboard / input text, UTF-8 bytes
+MAX_DATAGRAM = 1024                # UDP discovery
+MAX_PENDING_CONNECTIONS = 16       # sockets not yet `ready` ...
+MAX_UNREADY_PER_ADDRESS = 4        # ... and of those, per source address (the oldest is closed to make room)
+MAX_HANDSHAKES = 64                # TLS handshakes in progress at once
+MAX_ID = 2147483647
+
+HANDSHAKE_TIMEOUT = 10             # s, TLS accept → ready
+TLS_HANDSHAKE_TIMEOUT = 5          # s for the TLS handshake itself
+FIRST_FRAME_TIMEOUT = 5            # s after the handshake for the first frame
+PAIR_CONFIRM_TIMEOUT = 10          # s from pair.challenge to pair.confirm
+PAIR_CODE_PER_ADDRESS = 3          # tokenless pair.requests per source address per pairing window
+PAIR_TOKEN_TTL = 120               # s, QR token lifetime
+PAIR_CODE_TTL = 60                 # s, pairing B: desktop user's answer
+PING_IDLE = 20                     # s with nothing received → send ping
+DEAD_PEER = 45                     # s with nothing received → close
+RING_TIMEOUT = 10                  # s for the phone's status.ring reply
+AUTH_FAIL_LIMIT = 5                # failures per device ...
+AUTH_FAIL_WINDOW = 60              # ... within this many s → locked this many s
+DISCOVERY_RATE = 10                # announces per second, in total
+NOTIFY_KEEP = 50                   # open notifications remembered for notifications.list
+NOTIFY_SUMMARY_MAX = 512           # characters of a mirrored notification's summary ...
+NOTIFY_BODY_MAX = 4096             # ... and body (§2: nothing over 1 MiB goes on the wire)
+MEDIA_DEBOUNCE = 0.15              # s
+COMMAND_TIMEOUT = 10               # s a command may run before the reply says detached
+COMMAND_TIMEOUT_MAX = 25           # s, so the reply still beats the phone's 30 s commands.run timeout
+COMMAND_OUTPUT_TAIL = 4096         # bytes of output returned with showOutput
+SCREEN_STALL = 30                  # s without screen.ack → screen.stopped "stalled"
+THEME_POLL = 2                     # s between theme file checks
+
+# Error codes (§7). Fatal ones close the connection after the error frame.
+ERR_BAD_FRAME = "bad_frame"
+ERR_TOO_LARGE = "too_large"
+ERR_BAD_JSON = "bad_json"
+ERR_BAD_MESSAGE = "bad_message"
+ERR_UNKNOWN_TYPE = "unknown_type"
+ERR_NOT_AUTHENTICATED = "not_authenticated"
+ERR_PROTOCOL_VERSION = "protocol_version"
+ERR_UNKNOWN_DEVICE = "unknown_device"
+ERR_AUTH_FAILED = "auth_failed"
+ERR_RATE_LIMITED = "rate_limited"
+ERR_REPLACED = "replaced"
+ERR_PLUGIN_UNAVAILABLE = "plugin_unavailable"
+ERR_INVALID_ARGUMENT = "invalid_argument"
+ERR_NOT_FOUND = "not_found"
+ERR_BUSY = "busy"
+ERR_TIMEOUT = "timeout"
+ERR_FAILED = "failed"
+ERR_INTERNAL = "internal"
+ERR_SHUTDOWN = "shutdown"
+FATAL_ERRORS = {
+    ERR_BAD_FRAME, ERR_TOO_LARGE, ERR_BAD_JSON, ERR_NOT_AUTHENTICATED, ERR_PROTOCOL_VERSION,
+    ERR_UNKNOWN_DEVICE, ERR_AUTH_FAILED, ERR_RATE_LIMITED, ERR_REPLACED, ERR_SHUTDOWN,
+}
+
+# Control-socket error codes (§9) that are not wire codes
+CERR_BAD_REQUEST = "bad_request"
+CERR_UNKNOWN_CMD = "unknown_cmd"
+CERR_NO_DEVICE = "no_device"
+CERR_AMBIGUOUS_DEVICE = "ambiguous_device"
+CERR_NOT_CONNECTED = "not_connected"
+CERR_NO_PENDING = "no_pending"
+
+# Core message types (§5, §6, §4.5)
+T_HELLO = "hello"
+T_CHALLENGE = "challenge"
+T_AUTH = "auth"
+T_READY = "ready"
+T_ERROR = "error"
+T_PING = "ping"
+T_PONG = "pong"
+T_PAIR_REQUEST = "pair.request"
+T_PAIR_CHALLENGE = "pair.challenge"
+T_PAIR_CONFIRM = "pair.confirm"
+T_PAIR_PENDING = "pair.pending"
+T_PAIR_ACCEPT = "pair.accept"
+T_PAIR_REJECT = "pair.reject"
+T_PAIR_UNPAIR = "pair.unpair"
+PRE_READY_TYPES = {T_HELLO, T_AUTH, T_PAIR_REQUEST, T_PAIR_CONFIRM, T_PING}
+CORE_TYPES = {T_HELLO, T_CHALLENGE, T_AUTH, T_READY, T_ERROR, T_PING, T_PONG, T_PAIR_REQUEST, T_PAIR_CHALLENGE,
+              T_PAIR_CONFIRM, T_PAIR_PENDING, T_PAIR_ACCEPT, T_PAIR_REJECT, T_PAIR_UNPAIR}
+# The phone's plugin messages that are pushes (§8); any other plugin type without an `id` is ignored (§2).
+PUSH_TYPES = {"input.move", "input.moveAbsolute", "input.button", "input.scroll", "screen.ack", "status.battery"}
+
+# CLI exit codes
+EXIT_OK = 0
+EXIT_FAILURE = 1
+EXIT_USAGE = 2                     # bad arguments
+EXIT_NO_DAEMON = 3                 # control socket unreachable
+EXIT_NO_DEVICE = 4                 # device not found, ambiguous or not connected
+
+DEFAULT_CONFIG = {
+    # "" → the system hostname. Shown on the phone and in the pairing URI.
+    "name": "",
+    # Answer UDP discovery queries. Off means only QR pairing, and a paired
+    # phone cannot refind the host after its address changes.
+    "discovery": True,
+    # Per-plugin switch; a plugin set false is never offered.
+    "plugins": {
+        "notifications": True, "media": True, "commands": True, "clipboard": True,
+        "input": True, "screen": True, "status": True, "theme": True,
+    },
+    "notifications": {
+        # app_name values never forwarded (case-insensitive).
+        "ignoreApps": [],
+    },
+}
+
+# Our own notifications (pairing prompt, pings) carry this app name and are never mirrored.
+APP_NAME = "Ionix Link"
+
+HEX32 = re.compile(r"[0-9a-fA-F]{32}")
+HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+
+# Interfaces whose addresses a phone cannot reach (container and VM bridges); left out of the pairing URI.
+VIRTUAL_IFACES = ("docker", "br-", "veth", "virbr", "vnet", "vmnet", "cni", "flannel", "podman", "lxcbr", "lxdbr")
+
+
+# ── Paths, environment and small helpers ───────────────────────────────────
+#
+# Every path and the port can be moved by environment, so the whole daemon can
+# run against a scratch dir:
+#   IONIX_LINK_PORT, IONIX_LINK_BIND, IONIX_LINK_NAME, IONIX_LINK_DISCOVERY (0/1),
+#   IONIX_LINK_DATA_DIR, IONIX_LINK_STATE_DIR, IONIX_LINK_CONFIG_DIR, IONIX_LINK_SOCKET,
+#   IONIX_LINK_THEME_DIR, IONIX_LINK_THEME_NAME_FILE, IONIX_LINK_POWER_SUPPLY_DIR,
+#   IONIX_LINK_DEBUG (1 = verbose log), and IONIX_LINK_BIN_<TOOL> for any tool
+#   (IONIX_LINK_BIN_GRIM=/path/to/fake-grim), resolved by tool().
+
+
+def xdg(var, fallback):
+    """The XDG base directory `var`, or `~/<fallback>` when unset or empty."""
+    v = os.environ.get(var, "")
+    if v:
+        return v
+    return os.path.join(os.path.expanduser("~"), fallback)
+
+
+def socket_path():
+    """The control socket path (§9), on its own so the CLI never needs the rest of Paths."""
+    override = os.environ.get("IONIX_LINK_SOCKET", "")
+    if override:
+        return override
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "") or f"/run/user/{os.getuid()}"
+    return os.path.join(runtime, "ionix-link.sock")
+
+
+class Paths:
+    """Every file location, resolved once from the environment (see above)."""
+
+    def __init__(self):
+        env = os.environ
+        config_home = xdg("XDG_CONFIG_HOME", ".config")
+        self.data_dir = env.get("IONIX_LINK_DATA_DIR") or os.path.join(xdg("XDG_DATA_HOME", ".local/share"), "ionix", "link")
+        self.state_dir = env.get("IONIX_LINK_STATE_DIR") or os.path.join(xdg("XDG_STATE_HOME", ".local/state"), "ionix", "link")
+        self.config_dir = env.get("IONIX_LINK_CONFIG_DIR") or os.path.join(config_home, "ionix", "link")
+        self.socket = socket_path()
+        self.bind = env.get("IONIX_LINK_BIND") or None
+
+        port = env.get("IONIX_LINK_PORT", "")
+        if port:
+            if not port.isdigit() or not 1 <= int(port) <= 65535:
+                raise LinkError(CERR_BAD_REQUEST, f"IONIX_LINK_PORT must be a port number from 1 to 65535, not {port!r}.")
+            self.port = int(port)
+        else:
+            self.port = DEFAULT_PORT
+
+        self.host_file = os.path.join(self.data_dir, "host.json")
+        self.cert_file = os.path.join(self.data_dir, "cert.pem")
+        self.key_file = os.path.join(self.data_dir, "key.pem")
+        self.devices_file = os.path.join(self.data_dir, "devices.json")
+        self.state_file = os.path.join(self.state_dir, "state.json")
+        self.config_file = os.path.join(self.config_dir, "config.json")
+        self.commands_file = os.path.join(self.config_dir, "commands.json")
+
+        # The desktop shell's files, read by the theme plugin (§8.8)
+        self.theme_dir = env.get("IONIX_LINK_THEME_DIR") or os.path.join(config_home, "quickshell", "ionix")
+        self.theme_name_file = env.get("IONIX_LINK_THEME_NAME_FILE") or os.path.join(config_home, "ionix", "current-theme")
+        self.power_supply_dir = env.get("IONIX_LINK_POWER_SUPPLY_DIR") or "/sys/class/power_supply"
+
+
+def tool(name):
+    """Absolute path of tool `name`: $IONIX_LINK_BIN_<NAME> (upper-case, `-` → `_`), else PATH, else None."""
+    override = os.environ.get("IONIX_LINK_BIN_" + name.upper().replace("-", "_"), "")
+    if override:
+        # An override that does not exist fakes a missing tool.
+        return override if os.access(override, os.X_OK) else None
+    return shutil.which(name)
+
+
+DEBUG = os.environ.get("IONIX_LINK_DEBUG", "") == "1"
+
+
+def log(msg, debug=False):
+    """One line to stderr (the journal under systemd). `debug` lines only with IONIX_LINK_DEBUG=1."""
+    if debug and not DEBUG:
+        return
+    try:
+        print(f"ionix-link: {msg}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def now_ms():
+    """Unix time in milliseconds."""
+    return int(time.time() * 1000)
+
+
+def read_json(path, default):
+    """Parse `path`, returning `default` when missing, empty, invalid or of another type than `default`."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except (OSError, UnicodeDecodeError):
+        return default
+    if not raw.strip():
+        return default
+    try:
+        parsed = json.loads(raw)
+    except ValueError as e:
+        log(f"{path}: invalid JSON, ignoring it ({e}).")
+        return default
+    return parsed if isinstance(parsed, type(default)) else default
+
+
+def write_json_atomic(path, data, mode=0o644):
+    """Write `data` to `path` via a temp file and rename, with `mode`. Creates the directory 0700."""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            if mode & 0o077 == 0:
+                # Keys: worth an fsync so a crash cannot leave an empty file behind.
+                f.flush()
+                os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def deep_merge(base, overlay):
+    """Merge dict `overlay` into `base` in place; nested dicts merge, everything else replaces."""
+    if not isinstance(overlay, dict):
+        return base
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            deep_merge(base[k], v)
+        elif v is not None:
+            base[k] = copy.deepcopy(v)
+    return base
+
+
+def load_config(paths):
+    """DEFAULT_CONFIG deep-merged with config.json, then environment overrides applied."""
+    config = deep_merge(copy.deepcopy(DEFAULT_CONFIG), read_json(paths.config_file, {}))
+    name = os.environ.get("IONIX_LINK_NAME", "")
+    if name:
+        config["name"] = name
+    discovery = os.environ.get("IONIX_LINK_DISCOVERY", "")
+    if discovery:
+        config["discovery"] = discovery not in ("0", "false", "no", "off")
+    if not isinstance(config.get("name"), str):
+        config["name"] = ""
+    if not isinstance(config.get("plugins"), dict):
+        config["plugins"] = copy.deepcopy(DEFAULT_CONFIG["plugins"])
+    ignore = config.get("notifications", {}).get("ignoreApps") if isinstance(config.get("notifications"), dict) else None
+    config["notifications"] = {"ignoreApps": [a for a in ignore if isinstance(a, str)] if isinstance(ignore, list) else []}
+    return config
+
+
+def _route_address(family, probe):
+    """The source address the kernel would use towards `probe` (UDP connect sends nothing), or None."""
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            s.connect((probe, 9))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+def _usable_address(addr):
+    try:
+        ip = ipaddress.ip_address(addr.split("%")[0])
+    except ValueError:
+        return False
+    return not (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast)
+
+
+async def local_addresses():
+    """Non-loopback, non-link-local addresses of this host, IPv4 first (for the pairing URI).
+
+    stdlib has no interface list: use `ip -j addr` when present, else the UDP-connect trick for the default route.
+    The default route's address comes first in each family; container and VM bridges are left out.
+    (Async because `ip` is a subprocess and nothing may block the loop.)
+    """
+    primary = [a for a in (_route_address(socket.AF_INET, "192.0.2.1"), _route_address(socket.AF_INET6, "2001:db8::1")) if a]
+    found = []
+    ip_tool = tool("ip")
+    if ip_tool:
+        try:
+            rc, out, _ = await run_tool([ip_tool, "-j", "addr", "show", "up"], timeout=3)
+        except LinkError:
+            rc, out = 1, b""
+        try:
+            interfaces = json.loads(out) if rc == 0 else []
+        except ValueError:
+            interfaces = []
+        for itf in interfaces if isinstance(interfaces, list) else []:
+            name = str(itf.get("ifname", ""))
+            flags = itf.get("flags", [])
+            if "LOOPBACK" in flags or "NO-CARRIER" in flags or name.startswith(VIRTUAL_IFACES):
+                continue
+            for a in itf.get("addr_info", []):
+                local = a.get("local")
+                if not isinstance(local, str) or a.get("scope") in ("host", "link"):
+                    continue
+                if a.get("deprecated") or a.get("tentative") or a.get("dadfailed"):
+                    continue
+                found.append(local)
+    for a in primary:
+        if a not in found:
+            found.append(a)
+    found = [a for a in dict.fromkeys(found) if _usable_address(a)]
+
+    def rank(a):
+        return (":" in a, a not in primary)
+
+    return sorted(found, key=rank)
+
+
+async def run_tool(argv, stdin=None, timeout=10, capture=True):
+    """Run a tool to completion; returns (exit_code, stdout_bytes, stderr_bytes). Kills it on timeout → LinkError(timeout).
+
+    `capture=False` sends output to /dev/null, for tools that fork a child which keeps the pipe (wl-copy).
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+        )
+    except OSError as e:
+        raise LinkError(ERR_FAILED, f"Could not run {argv[0]}: {e.strerror or e}.")
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
+    except TimeoutError:
+        _kill(proc)
+        await proc.wait()
+        raise LinkError(ERR_TIMEOUT, f"{os.path.basename(argv[0])} did not finish within {timeout:g} s.")
+    except asyncio.CancelledError:
+        _kill(proc)
+        raise
+    return proc.returncode, out or b"", err or b""
+
+
+def _kill(proc):
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+def markup_escape(text):
+    """Escape text for a notification body, which servers may read as markup."""
+    return html.escape(text, quote=False)
+
+
+_LINE_BREAKS = re.compile("[\r\n\x85\u2028\u2029]+")
+_UNSAFE_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean_text(value, limit=64):
+    """A name from an unauthenticated peer, safe to store, print and show: line breaks become spaces; C0/C1
+    controls, DEL and bidi controls are dropped (so no terminal escapes or reordered text); trimmed, capped."""
+    if not isinstance(value, str):
+        return ""
+    value = _UNSAFE_CHARS.sub("", _LINE_BREAKS.sub(" ", value))
+    return " ".join(value.split())[:limit].strip()
+
+
+def fit_json_text(text, budget):
+    """`text`, cut so its JSON string (escapes included) is at most `budget` bytes of UTF-8."""
+    def size(s):
+        return len(json.dumps(s, ensure_ascii=False).encode("utf-8"))
+
+    if size(text) <= budget:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if size(text[:mid]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]
+
+
+def strip_markup(text):
+    """Notification body markup (`<b>`, `<a href>`, `<br>`) → plain text, entities decoded."""
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    return html.unescape(re.sub(r"<[^>]*>", "", text))
+
+
+def jpeg_size(data):
+    """(width, height) from a JPEG's SOF marker, or None."""
+    i = 2
+    n = len(data)
+    while i + 9 < n:
+        if data[i] != 0xFF:
+            return None
+        marker = data[i + 1]
+        if marker == 0xFF:
+            i += 1
+            continue
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        seg = struct.unpack(">H", data[i + 2:i + 4])[0]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            h, w = struct.unpack(">HH", data[i + 5:i + 9])
+            return w, h
+        i += 2 + seg
+    return None
+
+
+def is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+class LineProcess:
+    """A long-running tool whose stdout lines feed `on_line`; restarted with backoff while it is wanted."""
+
+    def __init__(self, label, argv_fn, on_line):
+        self.label = label
+        self.argv_fn = argv_fn       # called on every (re)start; None → give up
+        self.on_line = on_line
+        self.proc = None
+        self.task = None
+
+    def start(self):
+        if self.task is None:
+            self.task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        delay = 1
+        while True:
+            argv = self.argv_fn()
+            if not argv:
+                return
+            started = time.monotonic()
+            try:
+                self.proc = await asyncio.create_subprocess_exec(
+                    *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                    stderr=None if DEBUG else asyncio.subprocess.DEVNULL, limit=16 * 1024 * 1024)
+            except OSError as e:
+                log(f"Could not start {self.label}: {e.strerror or e}.")
+            else:
+                try:
+                    while True:
+                        try:
+                            line = await self.proc.stdout.readline()
+                        except ValueError:
+                            continue      # one over-long line, already discarded
+                        if not line:
+                            break
+                        try:
+                            self.on_line(line.decode("utf-8", "replace").rstrip("\n"))
+                        except Exception:
+                            log(f"{self.label}: error handling a line:\n{traceback.format_exc()}")
+                finally:
+                    _kill(self.proc)
+                    await self.proc.wait()
+                log(f"{self.label} exited (status {self.proc.returncode}); restarting in {delay} s.", debug=True)
+            if time.monotonic() - started > 30:
+                delay = 1
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
+
+    async def stop(self):
+        if self.task is None:
+            return
+        self.task.cancel()
+        try:
+            await self.task
+        except asyncio.CancelledError:
+            pass
+        self.task = None
+        if self.proc is not None:
+            _kill(self.proc)
+            await self.proc.wait()
+            self.proc = None
+
+
+# ── Errors ─────────────────────────────────────────────────────────────────
+
+
+class LinkError(Exception):
+    """An error that becomes an `error` message (§7). `fatal` defaults from FATAL_ERRORS.
+
+    `re` is set by read_message for a `bad_message` whose `id` was readable, so the error can answer it.
+    """
+
+    def __init__(self, code, message, fatal=None, details=None, re=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.fatal = code in FATAL_ERRORS if fatal is None else fatal
+        self.details = details or {}
+        self.re = re
+
+    def body(self):
+        """The `error` message body."""
+        body = {"code": self.code, "message": self.message, "fatal": self.fatal}
+        if self.details:
+            body["details"] = self.details
+        return body
+
+
+class UsageError(Exception):
+    """Bad CLI arguments; main() prints it with the command's usage and exits EXIT_USAGE."""
+
+
+# ── Identity: host id, certificate, crypto (§2, §4.4, §5) ──────────────────
+
+
+class Identity:
+    """The host's id and TLS certificate, created on first start and never rewritten."""
+
+    def __init__(self, paths):
+        self.paths = paths
+        self.host_id = None        # hex32
+        self.fingerprint = None    # hex64, SHA-256 of the certificate DER
+        self.cert_der = None
+
+    def load_or_create(self):
+        """Read host.json and the PEMs; make them if missing.
+
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650
+                    -subj "/CN=ionix-link <hostId>" -keyout key.pem -out cert.pem
+        (blocking is fine here: it runs once, before the loop starts.) Without openssl, raise a readable error
+        with the install hint for Arch (`pacman -S openssl`) and Debian (`apt install openssl`).
+        """
+        p = self.paths
+        os.makedirs(p.data_dir, mode=0o700, exist_ok=True)
+        host = read_json(p.host_file, {})
+        host_id = host.get("hostId")
+        if not isinstance(host_id, str) or not HEX32.fullmatch(host_id):
+            host_id = secrets.token_hex(16)
+            write_json_atomic(p.host_file, {"version": 1, "hostId": host_id, "created": now_ms()}, 0o600)
+            log(f"Created host id {host_id}.")
+        self.host_id = host_id.lower()
+
+        if not (os.path.isfile(p.cert_file) and os.path.isfile(p.key_file)):
+            self._make_certificate()
+        try:
+            os.chmod(p.key_file, 0o600)
+            with open(p.cert_file, encoding="ascii") as f:
+                pem = f.read()
+            self.cert_der = ssl.PEM_cert_to_DER_cert(pem)
+        except (OSError, ValueError, UnicodeDecodeError) as e:
+            raise LinkError(ERR_FAILED, f"Could not read the certificate {p.cert_file}: {e}. Move cert.pem and key.pem "
+                            "away to make a new pair (every phone must then pair again).")
+        self.fingerprint = hashlib.sha256(self.cert_der).hexdigest()
+
+    def _make_certificate(self):
+        openssl = tool("openssl")
+        if not openssl:
+            raise LinkError(ERR_FAILED, "openssl is needed to make the TLS certificate. Install it with "
+                            "`sudo pacman -S openssl` (Arch) or `sudo apt install openssl` (Debian/Ubuntu).")
+        p = self.paths
+        tmp = tempfile.mkdtemp(prefix=".cert-", dir=p.data_dir)
+        key, cert = os.path.join(tmp, "key.pem"), os.path.join(tmp, "cert.pem")
+        try:
+            result = subprocess.run(
+                [openssl, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-noenc",
+                 "-days", "3650", "-subj", f"/CN=ionix-link {self.host_id}", "-keyout", key, "-out", cert],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+            if result.returncode != 0 or not os.path.isfile(cert):
+                err = result.stderr.decode("utf-8", "replace").strip().splitlines()
+                raise LinkError(ERR_FAILED, f"openssl could not make the certificate: {err[-1] if err else 'no output'}.")
+            os.chmod(key, 0o600)
+            os.chmod(cert, 0o644)
+            # The key first: a cert.pem on disk always has its key beside it.
+            os.replace(key, p.key_file)
+            os.replace(cert, p.cert_file)
+            log(f"Created the TLS certificate {p.cert_file}.")
+        except subprocess.TimeoutExpired:
+            raise LinkError(ERR_FAILED, "openssl took over a minute to make the certificate.")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def ssl_context(self):
+        """Server SSLContext: PROTOCOL_TLS_SERVER, minimum TLSv1_2, the cert chain, no client certs."""
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(self.paths.cert_file, self.paths.key_file)
+        return ctx
+
+
+def auth_mac(key_hex, nonce_hex, fingerprint_hex):
+    """HMAC-SHA256(key, nonce || fingerprint) over raw bytes, hex. Vector in PROTOCOL.md §5."""
+    return hmac.new(bytes.fromhex(key_hex), bytes.fromhex(nonce_hex) + bytes.fromhex(fingerprint_hex),
+                    hashlib.sha256).hexdigest()
+
+
+def pairing_code(fingerprint_hex, np_hex, nd_hex):
+    """u32 BE of SHA-256(fingerprint || Np || Nd)[0:4] mod 1e6, zero-padded to 6. Vector in PROTOCOL.md §4.4.
+
+    Np is the phone's nonce (committed to before it saw Nd), Nd the daemon's, so neither side alone picks the code.
+    """
+    digest = hashlib.sha256(bytes.fromhex(fingerprint_hex) + bytes.fromhex(np_hex) + bytes.fromhex(nd_hex)).digest()
+    return f"{struct.unpack('>I', digest[:4])[0] % 1000000:06d}"
+
+
+def format_code(code):
+    """`284105` → `284 105`, the way both sides display it."""
+    return f"{code[:3]} {code[3:]}"
+
+
+# ── Paired devices (§10) ───────────────────────────────────────────────────
+
+
+class DeviceStore:
+    """devices.json (0600): paired phones and their keys. Every change is saved at once."""
+
+    def __init__(self, paths):
+        self.paths = paths
+        self.devices = {}          # id → {id, name, model, key, paired, lastSeen}
+
+    def load(self):
+        data = read_json(self.paths.devices_file, {})
+        self.devices = {}
+        for d in data.get("devices", []) if isinstance(data.get("devices"), list) else []:
+            if not isinstance(d, dict):
+                continue
+            did, key = d.get("id"), d.get("key")
+            if not (isinstance(did, str) and HEX32.fullmatch(did) and isinstance(key, str) and HEX64.fullmatch(key)):
+                log(f"{self.paths.devices_file}: skipping an invalid device entry.")
+                continue
+            record = {"id": did.lower(), "name": str(d.get("name", "")), "model": str(d.get("model", "")),
+                      "key": key.lower(), "paired": d.get("paired") if is_int(d.get("paired")) else 0}
+            if is_int(d.get("lastSeen")):
+                record["lastSeen"] = d["lastSeen"]
+            self.devices[record["id"]] = record
+
+    def save(self):
+        write_json_atomic(self.paths.devices_file, {"version": 1, "devices": list(self.devices.values())}, 0o600)
+
+    def add(self, device_id, name, model):
+        """Pair (or re-pair) a device with a fresh 32-byte key; returns the record."""
+        record = {"id": device_id, "name": name, "model": model, "key": secrets.token_hex(32), "paired": now_ms()}
+        self.devices[device_id] = record
+        self.save()
+        return record
+
+    def remove(self, device_id):
+        record = self.devices.pop(device_id, None)
+        if record is not None:
+            self.save()
+        return record
+
+    def get(self, device_id):
+        return self.devices.get(device_id)
+
+    def touch(self, device_id, name=None):
+        """Update lastSeen (and name, from `hello`)."""
+        record = self.devices.get(device_id)
+        if record is None:
+            return
+        record["lastSeen"] = now_ms()
+        if name:
+            record["name"] = name
+        self.save()
+
+    def resolve(self, query):
+        """A DEVICE argument (§9): exact id, unique prefix ≥ 4 chars, or case-insensitive exact name.
+
+        Returns the record; raises LinkError("no_device" | "ambiguous_device").
+        """
+        if not isinstance(query, str) or not query:
+            raise LinkError(CERR_BAD_REQUEST, "Name a device: an id, an id prefix or a phone name.")
+        q = query.lower()
+        if q in self.devices:
+            return self.devices[q]
+        prefixed = [d for d in self.devices.values() if len(q) >= 4 and d["id"].startswith(q)]
+        if len(prefixed) == 1:
+            return prefixed[0]
+        named = [d for d in self.devices.values() if d["name"].casefold() == query.casefold()]
+        if len(named) == 1:
+            return named[0]
+        if len(prefixed) > 1 or len(named) > 1:
+            raise LinkError(CERR_AMBIGUOUS_DEVICE, f"\"{query}\" matches several phones. Use more of the id; "
+                            "\"ionix-link devices\" lists them.")
+        raise LinkError(CERR_NO_DEVICE, f"No paired phone matches \"{query}\". Run \"ionix-link devices\" to list them.")
+
+
+# ── Framing (§3) ───────────────────────────────────────────────────────────
+
+
+def encode_message(msg, data=None):
+    """One frame for message dict `msg`: kind 0, or kind 1 with `data` bytes. JSON compact, UTF-8."""
+    payload = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(payload) > MAX_JSON:
+        raise LinkError(ERR_INTERNAL, f"A {msg.get('type')} message of {len(payload)} bytes is over the 1 MiB JSON limit.")
+    if data is None:
+        return struct.pack(">IB", 1 + len(payload), KIND_JSON) + payload
+    if len(payload) > 0xFFFF:
+        raise LinkError(ERR_INTERNAL, "A binary frame's header is over 65535 bytes.")
+    return struct.pack(">IBH", 3 + len(payload) + len(data), KIND_BINARY, len(payload)) + payload + bytes(data)
+
+
+def _parse_json_message(raw):
+    try:
+        msg = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise LinkError(ERR_BAD_JSON, "A frame's payload is not a UTF-8 JSON object.")
+    if not isinstance(msg, dict):
+        raise LinkError(ERR_BAD_JSON, "A frame's payload is not a UTF-8 JSON object.")
+    return msg
+
+
+def _check_message(msg):
+    mid, re_ = msg.get("id"), msg.get("re")
+    readable_id = mid if is_int(mid) and 1 <= mid <= MAX_ID else None
+    if not isinstance(msg.get("type"), str) or not msg["type"]:
+        raise LinkError(ERR_BAD_MESSAGE, "A message is missing its \"type\".", re=readable_id)
+    if mid is not None and readable_id is None:
+        raise LinkError(ERR_BAD_MESSAGE, "A message's \"id\" must be an integer from 1 to 2147483647.")
+    if re_ is not None and not (is_int(re_) and 1 <= re_ <= MAX_ID):
+        raise LinkError(ERR_BAD_MESSAGE, "A message's \"re\" must be an integer from 1 to 2147483647.")
+    body = msg.get("body")
+    if body is None:
+        msg["body"] = {}
+    elif not isinstance(body, dict):
+        raise LinkError(ERR_BAD_MESSAGE, "A message's \"body\" must be an object.", re=readable_id)
+    return msg
+
+
+async def read_message(reader, max_frame):
+    """Read one frame from an asyncio StreamReader; returns (msg_dict, data_or_None).
+
+    Raises LinkError(bad_frame | too_large | bad_json | bad_message); EOF → asyncio.IncompleteReadError.
+    Checks `length` against `max_frame` before reading the payload.
+    """
+    length = struct.unpack(">I", await reader.readexactly(4))[0]
+    if length > max_frame:
+        raise LinkError(ERR_TOO_LARGE, f"A frame of {length} bytes is over the limit of {max_frame}.")
+    if length < 3:
+        raise LinkError(ERR_BAD_FRAME, f"A frame of {length} bytes is too short to hold a message.")
+    frame = await reader.readexactly(length)
+    kind = frame[0]
+    if kind == KIND_JSON:
+        if length - 1 > MAX_JSON:
+            raise LinkError(ERR_TOO_LARGE, "A JSON message is over 1 MiB.")
+        return _check_message(_parse_json_message(frame[1:])), None
+    if kind == KIND_BINARY:
+        header_len = struct.unpack(">H", frame[1:3])[0]
+        if 3 + header_len > length or header_len < 2:
+            raise LinkError(ERR_BAD_FRAME, "A binary frame's header is longer than the frame.")
+        msg = _parse_json_message(frame[3:3 + header_len])
+        return _check_message(msg), frame[3 + header_len:]
+    raise LinkError(ERR_BAD_FRAME, f"Unknown frame kind {kind}.")
+
+
+# ── One phone connection (§5, §6) ──────────────────────────────────────────
+
+
+class Connection:
+    """One TLS socket: handshake state machine, request/reply, keepalive, plugin dispatch.
+
+    States: "open" → ("pairing" → "open") → "challenged" → "ready" → "closed".
+    """
+
+    def __init__(self, daemon, reader, writer):
+        self.daemon = daemon
+        self.reader = reader
+        self.writer = writer
+        self.state = "open"
+        self.address = None        # peer IP
+        self.device = None         # DeviceStore record once ready
+        self.nonce = None          # challenge nonce, hex64
+        self.phone_plugins = {}    # name → {name, version, caps} from hello
+        self.plugins = {}          # name → negotiated {name, version, caps} (daemon caps)
+        self.next_id = 1
+        self.pending = {}          # id → Future of the reply
+        self.write_lock = asyncio.Lock()
+        self.last_received = time.monotonic()
+
+        self.tasks = set()         # request handlers, keepalive, pairing; cancelled on close
+        self.deadline = time.monotonic() + HANDSHAKE_TIMEOUT   # until `ready`
+        self.hello = None          # hello body
+        self.hello_device = None   # the device hello named, until auth
+        self.protocol = None
+        self.battery = None        # from status.battery
+        self.ping_sent = 0.0
+        self.closed = asyncio.Event()
+        self.accepted = time.monotonic()
+        self.first_frame = False   # nothing read yet: FIRST_FRAME_TIMEOUT applies
+        self.confirm = None        # Future of pair.confirm while a pair.challenge is out
+
+        peer = writer.get_extra_info("peername")
+        if peer:
+            addr = str(peer[0])
+            self.address = addr[7:] if addr.startswith("::ffff:") else addr
+
+    def label(self):
+        return f"{self.device['name']} ({self.address})" if self.device else str(self.address)
+
+    def phone_caps(self, plugin):
+        """The caps the phone listed for `plugin` in hello."""
+        info = self.phone_plugins.get(plugin)
+        return set(info["caps"]) if info else set()
+
+    def spawn(self, coro):
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self._task_done)
+        return task
+
+    def _task_done(self, task):
+        self.tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            e = task.exception()
+            log(f"{self.label()}: task failed: {''.join(traceback.format_exception(e)).strip()}")
+
+    async def run(self):
+        """Read loop until EOF/error/fatal; enforces HANDSHAKE_TIMEOUT and the keepalive task; always ends in close()."""
+        log(f"Connection from {self.address}.", debug=True)
+        self.spawn(self.keepalive())
+        try:
+            while self.state != "closed":
+                limit = MAX_FRAME if self.state == "ready" else MAX_FRAME_UNAUTH
+                try:
+                    msg, data = await read_message(self.reader, limit)
+                except LinkError as e:
+                    self.first_frame = True
+                    self.last_received = time.monotonic()
+                    await self.send_error(e, re=e.re)
+                    if e.fatal:
+                        break
+                    continue
+                self.first_frame = True
+                self.last_received = time.monotonic()
+                try:
+                    await self.handle(msg, data)
+                except LinkError as e:
+                    await self.send_error(e, re=msg.get("id"))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log(f"{self.label()}: bug handling {msg.get('type')}:\n{traceback.format_exc()}")
+                    if msg.get("id") is not None:
+                        await self.send_error(LinkError(ERR_INTERNAL, "The desktop hit a bug; see `journalctl --user -u ionix-link`."),
+                                              re=msg["id"])
+        except (asyncio.IncompleteReadError, ConnectionError, ssl.SSLError, OSError) as e:
+            log(f"{self.label()}: connection ended ({type(e).__name__}).", debug=True)
+        finally:
+            await self.close("connection ended")
+
+    async def send(self, type_, body=None, re=None, data=None, id_=None):
+        """Send a push (or a reply when `re` is set). Binary when `data` is given. Returns False once closed."""
+        if self.state == "closed":
+            return False
+        msg = {"type": type_}
+        if id_ is not None:
+            msg["id"] = id_
+        if re is not None:
+            msg["re"] = re
+        msg["body"] = body if body is not None else {}
+        try:
+            frame = encode_message(msg, data)
+        except LinkError as e:
+            # Never put an oversize message on the wire (§2); a request still gets its one reply.
+            log(f"{self.label()}: {e.message}")
+            if type_ == T_ERROR or re is None:
+                return False
+            frame = encode_message({"type": T_ERROR, "re": re, "body": LinkError(ERR_INTERNAL, "The reply was too "
+                                    "large to send.").body()})
+        async with self.write_lock:
+            if self.writer.is_closing():
+                return False
+            try:
+                self.writer.write(frame)
+                await self.writer.drain()
+            except (ConnectionError, OSError, ssl.SSLError, RuntimeError) as e:
+                log(f"{self.label()}: write failed ({type(e).__name__}).", debug=True)
+                asyncio.create_task(self.close("write failed"))
+                return False
+        return True
+
+    async def request(self, type_, body=None, timeout=15):
+        """Send a request and await its reply message; error replies raise LinkError."""
+        if self.state == "closed":
+            raise LinkError(CERR_NOT_CONNECTED, "The phone is not connected.")
+        mid = self.next_id
+        self.next_id = 1 if mid >= MAX_ID else mid + 1
+        fut = asyncio.get_running_loop().create_future()
+        self.pending[mid] = fut
+        try:
+            if not await self.send(type_, body, id_=mid):
+                raise LinkError(CERR_NOT_CONNECTED, "The phone disconnected.")
+            reply = await asyncio.wait_for(fut, timeout)
+        except TimeoutError:
+            raise LinkError(ERR_TIMEOUT, f"The phone did not answer {type_} within {timeout:g} s.")
+        finally:
+            self.pending.pop(mid, None)
+        if reply["type"] == T_ERROR:
+            b = reply["body"]
+            details = b.get("details") if isinstance(b.get("details"), dict) else None
+            raise LinkError(str(b.get("code") or ERR_FAILED), str(b.get("message") or "The phone reported an error."),
+                            fatal=False, details=details)
+        return reply
+
+    async def send_error(self, err, re=None):
+        """Send LinkError `err` as an `error` message; close afterwards when fatal."""
+        log(f"{self.label()}: error {err.code}: {err.message}", debug=not err.fatal or err.code == ERR_SHUTDOWN)
+        await self.send(T_ERROR, err.body(), re=re)
+        if err.fatal:
+            await self.close(err.code)
+
+    async def close(self, reason=None):
+        """Close once: fail pending requests, tell every plugin (on_close), update state.json."""
+        if self.state == "closed":
+            return
+        was_ready = self.state == "ready"
+        self.state = "closed"
+        if was_ready:
+            log(f"{self.label()} disconnected ({reason}).")
+        for fut in self.pending.values():
+            if not fut.done():
+                fut.set_exception(LinkError(CERR_NOT_CONNECTED, "The phone disconnected."))
+        current = asyncio.current_task()
+        for task in list(self.tasks):
+            if task is not current:
+                task.cancel()
+        daemon = self.daemon
+        daemon.unready.pop(self, None)
+        if self.device and daemon.connections.get(self.device["id"]) is self:
+            del daemon.connections[self.device["id"]]
+        for name in list(self.plugins):
+            await daemon.plugins[name].detach(self)
+        # Flushes what is queued (a fatal error frame), then a TLS shutdown bounded by ssl_shutdown_timeout=1.
+        try:
+            self.writer.close()
+            await asyncio.wait_for(self.writer.wait_closed(), 2)
+        except (TimeoutError, ConnectionError, OSError, ssl.SSLError):
+            self.writer.transport.abort()
+        self.closed.set()
+        daemon.state.changed()
+
+    async def handle(self, msg, data):
+        """Dispatch one message: replies to `pending`, pre-ready gate, core types, then the owning plugin."""
+        type_ = msg["type"]
+        mid = msg.get("id")
+        re_ = msg.get("re")
+        body = msg["body"]
+
+        if re_ is not None and mid is None:
+            fut = self.pending.get(re_)
+            if fut is not None and not fut.done():
+                fut.set_result(msg)
+            else:
+                log(f"{self.label()}: reply {type_} to unknown request {re_}.", debug=True)
+            return
+
+        if self.state != "ready" and type_ not in PRE_READY_TYPES:
+            raise LinkError(ERR_NOT_AUTHENTICATED, "Send hello and auth (or pair.request) before anything else.")
+
+        if self.confirm is not None and not self.confirm.done():
+            # §4.5: pair.confirm is only valid as the very next message after pair.challenge.
+            if type_ == T_PAIR_CONFIRM and mid is not None:
+                self.confirm.set_result(msg)
+                return
+            raise LinkError(ERR_BAD_MESSAGE, "Send pair.confirm right after pair.challenge.", fatal=True)
+        if type_ == T_PAIR_CONFIRM:
+            raise LinkError(ERR_BAD_MESSAGE, "pair.confirm without a pair.challenge before it.")
+
+        if type_ == T_PING:
+            if mid is not None:
+                await self.send(T_PONG, {}, re=mid)
+            return
+        if type_ == T_HELLO:
+            if self.state == "ready":
+                log(f"{self.label()}: hello after ready, ignored.", debug=True)
+                return
+            await self.on_hello(msg)
+            return
+        if type_ == T_AUTH:
+            if self.state == "ready":
+                return
+            await self.on_auth(msg)
+            return
+        if type_ == T_PAIR_REQUEST:
+            if mid is None:
+                raise LinkError(ERR_BAD_MESSAGE, "pair.request is a request: give it an id.")
+            if self.state != "open":
+                raise LinkError(ERR_BAD_MESSAGE, "pair.request is only accepted before hello, one at a time.")
+            self.state = "pairing"
+            self.spawn(self._pair(msg))
+            return
+        if type_ == T_ERROR:
+            log(f"{self.label()}: the phone sent error {body.get('code')}: {body.get('message')}", debug=True)
+            if body.get("fatal") is True:
+                await self.close(f"phone error {body.get('code')}")
+            return
+        if type_ == T_PAIR_UNPAIR:
+            log(f"{self.label()} unpaired itself.")
+            await self.daemon.unpair(self.device["id"], notify=False)
+            return
+        if type_ in CORE_TYPES or "." not in type_:
+            if mid is not None:
+                raise LinkError(ERR_UNKNOWN_TYPE, f"Unknown message type \"{type_}\".")
+            return
+
+        plugin_name = type_.split(".", 1)[0]
+        if plugin_name not in self.plugins:
+            if mid is None:
+                log(f"{self.label()}: push {type_} for a plugin not negotiated, ignored.", debug=True)
+                return
+            if plugin_name in self.daemon.plugins:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, f"The {plugin_name} plugin is not available on this connection.")
+            raise LinkError(ERR_UNKNOWN_TYPE, f"Unknown message type \"{type_}\".")
+        plugin = self.daemon.plugins[plugin_name]
+        if mid is None:
+            if type_ not in PUSH_TYPES:
+                # §2: a request type without an id never runs (commands.run, input.text...).
+                log(f"{self.label()}: {type_} without an id, ignored.", debug=True)
+                return
+            # Pushes run inline, in order (pointer moves, acks); they must be quick.
+            try:
+                await plugin.handle(self, msg, data)
+            except LinkError as e:
+                log(f"{self.label()}: push {type_} ignored: {e.message}", debug=True)
+            return
+        self.spawn(self._serve(plugin, msg, data))
+
+    async def _pair(self, msg):
+        try:
+            await self.daemon.pairing.on_request(self, msg)
+        finally:
+            if self.state == "pairing":
+                self.state = "open"
+
+    async def _serve(self, plugin, msg, data):
+        """Run one request in its own task, so a slow one (a command, a ring) never stalls the read loop."""
+        mid = msg["id"]
+        try:
+            result = await plugin.handle(self, msg, data)
+        except LinkError as e:
+            await self.send_error(e, re=mid)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log(f"{self.label()}: bug in {msg['type']}:\n{traceback.format_exc()}")
+            await self.send_error(LinkError(ERR_INTERNAL, "The desktop hit a bug; see `journalctl --user -u ionix-link`."), re=mid)
+            return
+        body, reply_data = result if isinstance(result, tuple) else (result, None)
+        await self.send(msg["type"], body if body is not None else {}, re=mid, data=reply_data)
+
+    async def on_hello(self, msg):
+        """Check protocol range and device; send `challenge`."""
+        if self.state not in ("open", "challenged"):
+            raise LinkError(ERR_BAD_MESSAGE, "Wait for the pairing answer before hello.")
+        b = msg["body"]
+        device_id = b.get("deviceId")
+        protocol = b.get("protocol")
+        protocol_min = b.get("protocolMin", protocol)
+        if not isinstance(device_id, str) or not HEX32.fullmatch(device_id):
+            raise LinkError(ERR_BAD_MESSAGE, "hello needs \"deviceId\", 32 hex characters.")
+        if not is_int(protocol) or not is_int(protocol_min):
+            raise LinkError(ERR_BAD_MESSAGE, "hello needs \"protocol\" (and an optional \"protocolMin\") as integers.")
+        chosen = min(protocol, PROTOCOL)
+        if chosen < max(protocol_min, PROTOCOL_MIN):
+            raise LinkError(ERR_PROTOCOL_VERSION, f"No common protocol version: the desktop speaks {PROTOCOL_MIN} to "
+                            f"{PROTOCOL}. Update the older side.", details={"min": PROTOCOL_MIN, "max": PROTOCOL})
+        device_id = device_id.lower()
+        if self.daemon.auth_locked(self.address):
+            raise LinkError(ERR_RATE_LIMITED, "Too many failed sign-ins from this address; wait a minute.")
+        device = self.daemon.devices.get(device_id)
+        if device is None:
+            raise LinkError(ERR_UNKNOWN_DEVICE, "This phone is not paired with the desktop. Pair it again.")
+
+        phone_plugins = {}
+        for p in b.get("plugins", []) if isinstance(b.get("plugins"), list) else []:
+            if isinstance(p, dict) and isinstance(p.get("name"), str):
+                caps = p.get("caps") if isinstance(p.get("caps"), list) else []
+                phone_plugins[p["name"]] = {"name": p["name"], "version": p["version"] if is_int(p.get("version")) else 1,
+                                            "caps": [c for c in caps if isinstance(c, str)]}
+        self.hello = b
+        self.hello_device = device_id
+        self.phone_plugins = phone_plugins
+        self.protocol = chosen
+        self.nonce = secrets.token_hex(32)
+        self.state = "challenged"
+        await self.send(T_CHALLENGE, {"nonce": self.nonce})
+
+    async def on_auth(self, msg):
+        """Verify the MAC (hmac.compare_digest, rate limit); negotiate plugins; send `ready`; replace any older
+        connection of this device; raise the frame limit; call plugin.on_ready for each negotiated plugin."""
+        if self.state != "challenged" or not self.nonce:
+            raise LinkError(ERR_NOT_AUTHENTICATED, "Send hello and wait for the challenge before auth.")
+        daemon = self.daemon
+        device_id = self.hello_device
+        nonce, self.nonce = self.nonce, None   # one MAC per challenge
+        device = daemon.devices.get(device_id)
+        if device is None:
+            raise LinkError(ERR_UNKNOWN_DEVICE, "This phone is not paired with the desktop. Pair it again.")
+        mac = msg["body"].get("mac")
+        expected = bytes.fromhex(auth_mac(device["key"], nonce, daemon.identity.fingerprint))
+        try:
+            given = bytes.fromhex(mac) if isinstance(mac, str) and HEX64.fullmatch(mac) else b""
+        except ValueError:
+            given = b""
+        if not hmac.compare_digest(expected, given):
+            daemon.auth_failed(self.address)
+            log(f"Failed sign-in from {device['name']} ({self.address}).")
+            raise LinkError(ERR_AUTH_FAILED, "Sign-in failed: the phone's key does not match. Pair it again.")
+        candidates = [p for p in daemon.available_plugins() if p.name in self.phone_plugins]
+        for p in candidates:
+            try:
+                await p.prepare()
+            except Exception:
+                log(f"{p.name}: prepare failed:\n{traceback.format_exc()}")
+        self.plugins = self.negotiate(self.phone_plugins)
+        name = clean_text(self.hello.get("name")) or None
+        daemon.devices.touch(device_id, name=name)
+        self.device = daemon.devices.get(device_id)
+        self.state = "ready"
+        daemon.unready.pop(self, None)
+        old = daemon.connections.get(device_id)
+        daemon.connections[device_id] = self
+
+        await self.send(T_READY, {"protocol": self.protocol, "hostId": daemon.identity.host_id,
+                                  "hostName": daemon.host_name(), "daemonVersion": VERSION,
+                                  "plugins": list(self.plugins.values())})
+        log(f"{self.label()} connected (plugins: {', '.join(self.plugins) or 'none'}).")
+        if old is not None and old is not self:
+            old.spawn(old.send_error(LinkError(ERR_REPLACED, "Another connection from this phone took over.")))
+        for pname in self.plugins:
+            plugin = daemon.plugins[pname]
+            await plugin.attach(self)
+        for pname in self.plugins:
+            try:
+                await daemon.plugins[pname].on_ready(self)
+            except LinkError as e:
+                log(f"{pname}: initial state not sent: {e.message}", debug=True)
+            except Exception:
+                log(f"{pname}: on_ready failed:\n{traceback.format_exc()}")
+        daemon.state.changed()
+
+    def negotiate(self, phone_plugins):
+        """`ready.plugins`: available here ∩ listed by the phone, version = min, caps = ours (§5)."""
+        result = {}
+        for p in self.daemon.available_plugins():
+            theirs = phone_plugins.get(p.name)
+            if theirs is None:
+                continue
+            result[p.name] = {"name": p.name, "version": min(p.version, theirs["version"]), "caps": p.caps()}
+        return result
+
+    async def keepalive(self):
+        """Send `ping` after PING_IDLE s of silence; close after DEAD_PEER s."""
+        while self.state != "closed":
+            await asyncio.sleep(1)
+            now = time.monotonic()
+            if not self.first_frame and now - self.accepted >= FIRST_FRAME_TIMEOUT:
+                log(f"{self.address}: no frame within {FIRST_FRAME_TIMEOUT} s of the handshake.", debug=True)
+                await self.close("no first frame")
+                return
+            if self.state != "ready" and now >= self.deadline:
+                await self.send_error(LinkError(ERR_TIMEOUT, "The handshake took too long; connect again.", fatal=True))
+                return
+            idle = now - self.last_received
+            if idle >= DEAD_PEER:
+                log(f"{self.label()}: nothing received for {DEAD_PEER} s.", debug=True)
+                await self.close("dead peer")
+                return
+            if idle >= PING_IDLE and self.ping_sent < self.last_received:
+                self.ping_sent = now
+                self.spawn(self._ping())
+
+    async def _ping(self):
+        try:
+            await self.request(T_PING, {}, timeout=DEAD_PEER)
+        except LinkError:
+            pass
+
+
+# ── Pairing (§4) ───────────────────────────────────────────────────────────
+
+
+class Pairing:
+    """The pairing window and the one pending code request at a time.
+
+    `ionix-link pair` opens the window: it holds the QR token, and code pairing (§4.3) is only taken while it is
+    open. It closes when the command's control connection goes away (Ctrl-C included), when a phone pairs, when a
+    newer `pair` replaces it, or after PAIR_TOKEN_TTL s.
+    """
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self.window = None         # {token, expires, waiters: [Futures of the final event], timer, owner, requests}
+        self.pending = None        # {conn, id, deviceId, name, model, code, replaces, expires, future, window}
+        self._notify_proc = None   # notify-send of the pending code request
+        self._notify_id = None     # its notification id, from --print-id
+
+    async def begin_qr(self, owner=None):
+        """New window and token (replacing any), returns {uri, token, expires, addresses} for the `pair` control
+        command. `owner` is that command's control connection: the window ends with it."""
+        self._end_window({"event": "replaced"})
+        token = secrets.token_hex(16)
+        expires = now_ms() + PAIR_TOKEN_TTL * 1000
+        addresses = await local_addresses()
+        timer = asyncio.get_running_loop().call_later(PAIR_TOKEN_TTL, self._expire, token)
+        self.window = {"token": token, "expires": expires, "waiters": [], "timer": timer, "owner": owner,
+                       "requests": {}}
+        self.daemon.state.changed()
+        log("Pairing window open (QR code and code pairing).", debug=True)
+        return {"uri": self.uri(token, expires, addresses), "token": token, "expires": expires, "addresses": addresses}
+
+    def wait_token(self):
+        """A Future of the current window's final event (paired, expired, replaced), for `pair` with wait."""
+        fut = asyncio.get_running_loop().create_future()
+        if self.window is None:
+            fut.set_result({"event": "expired"})
+        else:
+            self.window["waiters"].append(fut)
+        return fut
+
+    def _end_window(self, event, cancel_pending=False):
+        w = self.window
+        if w is None:
+            return
+        self.window = None
+        w["timer"].cancel()
+        for fut in w["waiters"]:
+            if not fut.done():
+                fut.set_result(event)
+        p = self.pending
+        if cancel_pending and p is not None and p["window"] is w and not p["future"].done():
+            p["future"].set_result("closed")
+        self.daemon.state.changed()
+
+    def _expire(self, token):
+        if self.window is not None and self.window["token"] == token:
+            log("Pairing window expired.", debug=True)
+            self._end_window({"event": "expired"})
+
+    def control_closed(self, writer):
+        """A control connection went away; the window it opened ends with it, and so does its pending request."""
+        if self.window is not None and self.window["owner"] is writer:
+            log("Pairing window closed: `ionix-link pair` ended.", debug=True)
+            self._end_window({"event": "expired"}, cancel_pending=True)
+
+    def uri(self, token, expires, addresses):
+        """The ionixlink://pair URI (§4.2), every value percent-encoded."""
+        d = self.daemon
+
+        def q(v):
+            return urllib.parse.quote(str(v), safe="")
+
+        params = [("v", URI_VERSION), ("host", d.identity.host_id), ("name", d.host_name()), ("port", d.paths.port),
+                  ("fp", d.identity.fingerprint), ("token", token), ("exp", expires)]
+        params += [("addr", a) for a in addresses]
+        return "ionixlink://pair?" + "&".join(f"{k}={q(v)}" for k, v in params)
+
+    async def on_request(self, conn, msg):
+        """pair.request: token → accept/reject at once; commit → pair.challenge, then pair.confirm, pair.pending, the
+        notification, and the answer (§4.3)."""
+        mid = msg["id"]
+        b = msg["body"]
+        device_id, token, commit, protocol = b.get("deviceId"), b.get("token"), b.get("commit"), b.get("protocol")
+        if not isinstance(device_id, str) or not HEX32.fullmatch(device_id):
+            await conn.send_error(LinkError(ERR_BAD_MESSAGE, "pair.request needs \"deviceId\", 32 hex characters."), re=mid)
+            return
+        if (token is None) == (commit is None):
+            await conn.send_error(LinkError(ERR_BAD_MESSAGE, "pair.request needs exactly one of \"token\" and \"commit\"."), re=mid)
+            return
+        if not is_int(protocol) or protocol < PROTOCOL_MIN:
+            await self._reject(conn, mid, "protocol")
+            return
+        device_id = device_id.lower()
+        name = clean_text(b.get("name")) or "Phone"
+        model = clean_text(b.get("model"))
+
+        if token is not None:
+            w = self.window
+            if (w is not None and isinstance(token, str) and HEX32.fullmatch(token)
+                    and hmac.compare_digest(w["token"], token.lower())):
+                if now_ms() >= w["expires"]:
+                    self._end_window({"event": "expired"})
+                    await self._reject(conn, mid, "token_invalid")
+                    return
+                record = self.daemon.devices.add(device_id, name, model)
+                self._end_window({"event": "paired", "device": self.daemon.device_entry(record)})
+                log(f"Paired {name} ({model or 'unknown model'}) with a QR code.")
+                await self._accept(conn, mid, record)
+                return
+            await self._reject(conn, mid, "token_invalid")
+            return
+
+        w = self.window
+        if w is None:
+            await self._reject(conn, mid, "not_open")
+            return
+        count = w["requests"].get(conn.address, 0)
+        if count >= PAIR_CODE_PER_ADDRESS:
+            await self._reject(conn, mid, "rate_limited")
+            return
+        w["requests"][conn.address] = count + 1
+        if not isinstance(commit, str) or not HEX64.fullmatch(commit):
+            await conn.send_error(LinkError(ERR_BAD_MESSAGE, "pair.request's \"commit\" must be 64 hex characters."), re=mid)
+            return
+        if self.pending is not None:
+            await self._reject(conn, mid, "busy")
+            return
+
+        # Commit, then reveal: Nd goes out only after the phone is bound to its Np by the commit.
+        nd = secrets.token_hex(32)
+        confirm = asyncio.get_running_loop().create_future()
+        conn.confirm = confirm
+        conn.state = "pairing"
+        conn.deadline = time.monotonic() + PAIR_CONFIRM_TIMEOUT + 2
+        try:
+            await conn.send(T_PAIR_CHALLENGE, {"nonce": nd}, re=mid)
+            try:
+                reveal = await asyncio.wait_for(confirm, PAIR_CONFIRM_TIMEOUT)
+            except TimeoutError:
+                await conn.send_error(LinkError(ERR_TIMEOUT, "pair.confirm did not arrive within 10 s of pair.challenge.",
+                                                fatal=True))
+                return
+        finally:
+            conn.confirm = None
+        cid = reveal["id"]
+        np = reveal["body"].get("nonce")
+        if (not isinstance(np, str) or not HEX64.fullmatch(np)
+                or not hmac.compare_digest(hashlib.sha256(bytes.fromhex(np)).digest(), bytes.fromhex(commit))):
+            log(f"{name} ({conn.address}) sent a pair.confirm that does not match its commit.")
+            await self._reject(conn, cid, "bad_commit")
+            return
+        if self.window is not w:
+            await self._reject(conn, cid, "not_open")
+            return
+        if self.pending is not None:
+            await self._reject(conn, cid, "busy")
+            return
+
+        code = pairing_code(self.daemon.identity.fingerprint, np, nd)
+        old = self.daemon.devices.get(device_id)
+        fut = asyncio.get_running_loop().create_future()
+        pending = {"conn": conn, "id": cid, "deviceId": device_id, "name": name, "model": model, "code": code,
+                   "replaces": old["name"] if old else None, "expires": now_ms() + PAIR_CODE_TTL * 1000,
+                   "future": fut, "window": w}
+        self.pending = pending
+        conn.deadline = time.monotonic() + PAIR_CODE_TTL + 10
+        self.daemon.state.changed()
+        log(f"{name} asks to pair with code {format_code(code)}; answer with the notification or "
+            "`ionix-link pair accept|reject`.")
+        prompt = asyncio.create_task(self._prompt(pending))
+        try:
+            await conn.send(T_PAIR_PENDING, {"timeoutSec": PAIR_CODE_TTL})
+            try:
+                answer = await asyncio.wait_for(fut, PAIR_CODE_TTL)
+            except TimeoutError:
+                answer = "timeout"
+        finally:
+            prompt.cancel()
+            if self.pending is pending:
+                self.pending = None
+                self.daemon.state.changed()
+            await self._close_prompt()
+        if conn.state == "closed":
+            return
+        conn.state = "open"
+        if answer == "accept":
+            record = self.daemon.devices.add(device_id, name, model)
+            log(f"Paired {name} ({model or 'unknown model'}) with a code.")
+            if self.window is w:
+                self._end_window({"event": "paired", "device": self.daemon.device_entry(record)})
+            await self._accept(conn, cid, record)
+        else:
+            log(f"Pairing with {name} {'timed out' if answer == 'timeout' else 'rejected'}.")
+            await self._reject(conn, cid, "timeout" if answer == "timeout" else "rejected")
+
+    async def _accept(self, conn, mid, record):
+        d = self.daemon
+        conn.state = "open"
+        conn.deadline = time.monotonic() + HANDSHAKE_TIMEOUT
+        await conn.send(T_PAIR_ACCEPT, {"key": record["key"], "hostId": d.identity.host_id, "hostName": d.host_name(),
+                                        "fingerprint": d.identity.fingerprint}, re=mid)
+        d.state.changed()
+
+    async def _reject(self, conn, mid, reason):
+        conn.state = "open"
+        await conn.send(T_PAIR_REJECT, {"reason": reason}, re=mid)
+        conn.spawn(self._close_later(conn))
+
+    async def _close_later(self, conn):
+        await asyncio.sleep(1)
+        await conn.close("pairing rejected")
+
+    async def _prompt(self, pending):
+        action = await self.notify(pending["name"], pending["model"], pending["code"], pending["replaces"])
+        if action in ("accept", "reject") and not pending["future"].done():
+            pending["future"].set_result(action)
+
+    async def notify(self, name, model, code, replaces=None):
+        """notify-send --action=accept=Accept --action=reject=Reject -- ... ; returns "accept", "reject" or None."""
+        ns = tool("notify-send")
+        if not ns:
+            log("notify-send is missing (package libnotify); answer with `ionix-link pair accept|reject`.")
+            return None
+        self._notify_id = None
+        body = f"{model or name} shows {format_code(code)}. Accept only if the codes match."
+        if replaces:
+            body += f" This replaces the paired phone \"{replaces}\"."
+        # `--` first: name and model come from an unauthenticated peer and must never be read as options.
+        argv = [ns, f"--app-name={APP_NAME}", "--urgency=critical", f"--expire-time={PAIR_CODE_TTL * 1000}", "--print-id",
+                "--action=accept=Accept", "--action=reject=Reject", "--", f"Pair with {name}?", markup_escape(body)]
+        try:
+            proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.DEVNULL,
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        except OSError as e:
+            log(f"Could not run notify-send: {e.strerror or e}.")
+            return None
+        self._notify_proc = proc
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    return None
+                s = line.decode("utf-8", "replace").strip()
+                if s.isdigit() and self._notify_id is None:
+                    self._notify_id = int(s)
+                elif s in ("accept", "reject"):
+                    self._notify_id = None    # the server closes an answered notification itself
+                    return s
+        finally:
+            _kill(proc)
+            await proc.wait()
+            self._notify_proc = None
+
+    async def _close_prompt(self):
+        """Take an unanswered pairing notification off the screen (best effort)."""
+        nid, self._notify_id = self._notify_id, None
+        busctl = tool("busctl")
+        if nid is None or not busctl:
+            return
+        try:
+            await run_tool([busctl, "--user", "call", "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                            "org.freedesktop.Notifications", "CloseNotification", "u", str(nid)], timeout=3)
+        except LinkError:
+            pass
+
+    def respond(self, accept, code=None):
+        """Answer the pending code request (notification action or `ionix-link pair accept|reject`). With `code`,
+        only the request showing that code is answered, so a terminal never answers a request it did not show."""
+        p = self.pending
+        if p is None or p["future"].done():
+            raise LinkError(CERR_NO_PENDING, "No phone is waiting for a pairing answer.")
+        if code is not None and code != p["code"]:
+            raise LinkError(CERR_NO_PENDING, "That request is gone and another phone is asking now; run it again.")
+        p["future"].set_result("accept" if accept else "reject")
+        out = {"name": p["name"], "model": p["model"], "code": p["code"]}
+        if p["replaces"]:
+            out["replaces"] = p["replaces"]
+        return out
+
+    def state(self):
+        """The `pairing` field of state.json (§10)."""
+        if self.pending is not None:
+            p = self.pending
+            out = {"mode": "code", "expires": p["expires"], "name": p["name"], "model": p["model"], "code": p["code"]}
+            if p["replaces"]:
+                out["replaces"] = p["replaces"]
+            return out
+        if self.window is not None:
+            return {"mode": "qr", "expires": self.window["expires"]}
+        return None
+
+    async def shutdown(self):
+        self._end_window({"event": "expired"})
+        if self.pending is not None and not self.pending["future"].done():
+            self.pending["future"].set_result("timeout")
+        if self._notify_proc is not None:
+            _kill(self._notify_proc)
+        await self._close_prompt()
+
+
+# ── Plugins (§8) ───────────────────────────────────────────────────────────
+
+
+class Plugin:
+    """Base of every plugin. One instance per daemon; it serves every connection that negotiated it.
+
+    Override:
+      name, version, tools (required: all must exist), any_tools (at least one must exist)
+      caps()                → the caps to advertise, from which tools exist
+      prepare()             → async work available()/caps() depend on, run before each negotiation (input's pointer)
+      start() / stop()      → long-running observers; started when the first connection negotiates the
+                              plugin, stopped when the last one closes
+      on_ready(conn)        → push initial state (§5: status.host, media.players, media.volume)
+      handle(conn, msg, data) → a request's reply body (dict), or (body, data) for a binary reply, or None for a
+                              push; raise LinkError to fail
+      on_close(conn)        → per-connection cleanup (screen streams)
+    """
+
+    name = ""
+    version = 1
+    tools = ()
+    any_tools = ()
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self.connections = set()   # connections that negotiated this plugin
+        self.running = False
+        self.tasks = set()         # background tasks while running
+        # Serialises attach/detach/shutdown: a start() during an awaited stop() would otherwise lose its tasks
+        # and leave watchers (playerctl, pactl, busctl) orphaned.
+        self.lock = asyncio.Lock()
+
+    def available(self):
+        """Whether the plugin can run: enabled in config and its tools are present."""
+        if self.daemon.config["plugins"].get(self.name, True) is False:
+            return False
+        if not all(tool(t) for t in self.tools):
+            return False
+        return not self.any_tools or any(tool(t) for t in self.any_tools)
+
+    def caps(self):
+        return []
+
+    def info(self):
+        """{name, version, caps}."""
+        return {"name": self.name, "version": self.version, "caps": self.caps()}
+
+    async def prepare(self):
+        pass
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def on_ready(self, conn):
+        pass
+
+    async def handle(self, conn, msg, data):
+        raise LinkError(ERR_UNKNOWN_TYPE, f"Unknown message type {msg.get('type')!r}.")
+
+    async def on_close(self, conn):
+        pass
+
+    def spawn(self, coro):
+        """A background task that is cancelled when the plugin stops."""
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self._task_done)
+        return task
+
+    def _task_done(self, task):
+        self.tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log(f"{self.name}: task failed: {''.join(traceback.format_exception(task.exception())).strip()}")
+
+    async def attach(self, conn):
+        """A connection negotiated this plugin; the first one starts it."""
+        async with self.lock:
+            if conn.state == "closed":
+                return             # closed while waiting for the lock: its detach has already run
+            self.connections.add(conn)
+            if not self.running:
+                self.running = True
+                try:
+                    await self.start()
+                except Exception:
+                    log(f"{self.name}: start failed:\n{traceback.format_exc()}")
+
+    async def detach(self, conn):
+        """A connection closed; the last one stops the plugin."""
+        async with self.lock:
+            if conn not in self.connections:
+                return
+            self.connections.discard(conn)
+            try:
+                await self.on_close(conn)
+            except Exception:
+                log(f"{self.name}: on_close failed:\n{traceback.format_exc()}")
+            if not self.connections:
+                await self._stop()
+
+    async def shutdown(self):
+        async with self.lock:
+            await self._stop()
+
+    async def _stop(self):
+        if not self.running:
+            return
+        self.running = False
+        try:
+            await self.stop()
+        except Exception:
+            log(f"{self.name}: stop failed:\n{traceback.format_exc()}")
+        for task in list(self.tasks):
+            task.cancel()
+
+    async def broadcast(self, type_, body, phone_cap=None):
+        """Push to every connection that negotiated this plugin (and, for phone-side caps, advertised it)."""
+        targets = [c for c in self.connections if phone_cap is None or phone_cap in c.phone_caps(self.name)]
+        if targets:
+            await asyncio.gather(*(c.send(type_, body) for c in targets), return_exceptions=True)
+
+
+class NotificationsPlugin(Plugin):
+    """§8.1. Watches `busctl --user monitor --json=short` with matches for Notify method calls, method_returns
+    (pair each return's reply_serial with the call's cookie to learn the id) and NotificationClosed signals.
+    Forwards only to connections whose phone listed cap "mirror". Strips markup from body. Skips its own
+    "Ionix Link" notifications and config ignoreApps. Falls back to `dbus-monitor` (text output) when busctl
+    is missing or its monitor keeps failing."""
+
+    name = "notifications"
+    any_tools = ("busctl", "dbus-monitor")
+
+    MATCHES = [
+        "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
+        # sender= a well-known name follows its current owner, so a restarted server is still seen
+        "type='method_return',sender='org.freedesktop.Notifications'",
+        "type='signal',interface='org.freedesktop.Notifications',member='NotificationClosed'",
+    ]
+    CLOSE_REASONS = {1: "expired", 2: "dismissed", 3: "closed", 4: "undefined"}
+    URGENCY = {0: "low", 1: "normal", 2: "critical"}
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.store = {}            # id → Notification, insertion order = oldest first
+        self.calls = {}            # (sender, cookie) → (Notify args, monotonic)
+        self.monitor = None
+        self._busctl_failures = 0
+        self._text = None          # dbus-monitor parser state
+
+    def caps(self):
+        return ["dismiss"] if tool("busctl") else []
+
+    def _argv(self):
+        busctl = tool("busctl")
+        if busctl and self._busctl_failures < 3:
+            self._busctl_failures += 1     # reset by the first line read
+            return [busctl, "--user", "monitor", "--json=short"] + [f"--match={m}" for m in self.MATCHES]
+        dbus_monitor = tool("dbus-monitor")
+        if dbus_monitor:
+            self._text = {"msg": None}
+            return [dbus_monitor, "--session"] + self.MATCHES
+        log("Neither busctl nor dbus-monitor can watch the session bus; notifications stop.")
+        return None
+
+    async def start(self):
+        self.monitor = LineProcess("notification monitor", self._argv, self._on_line)
+        self.monitor.start()
+
+    async def stop(self):
+        if self.monitor is not None:
+            await self.monitor.stop()
+            self.monitor = None
+        # Without the monitor, closes are missed; what we remember would go stale.
+        self.store.clear()
+        self.calls.clear()
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        b = msg["body"]
+        if t == "notifications.list":
+            items = list(self.store.values())[-NOTIFY_KEEP:]
+            sizes = [len(json.dumps(n, ensure_ascii=False).encode("utf-8")) + 1 for n in items]
+            while items and sum(sizes) > MAX_JSON - 1024:     # §2: shortened from the oldest end
+                items.pop(0)
+                sizes.pop(0)
+            return {"notifications": items}
+        if t == "notifications.dismiss":
+            nid = b.get("id")
+            if not is_int(nid) or not 0 < nid <= 0xFFFFFFFF:
+                raise LinkError(ERR_INVALID_ARGUMENT, "notifications.dismiss needs \"id\", a notification id.")
+            if nid not in self.store:
+                raise LinkError(ERR_NOT_FOUND, f"No open notification with id {nid}.")
+            busctl = tool("busctl")
+            if not busctl:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, "busctl is needed to close notifications.")
+            rc, _, _ = await run_tool([busctl, "--user", "call", "org.freedesktop.Notifications",
+                                       "/org/freedesktop/Notifications", "org.freedesktop.Notifications",
+                                       "CloseNotification", "u", str(nid)], timeout=5)
+            return {"ok": rc == 0}
+        return await super().handle(conn, msg, data)
+
+    # Lines from the monitor
+
+    def _on_line(self, line):
+        if self._text is not None:
+            self._on_text_line(line)
+            return
+        if not line.startswith("{"):
+            return
+        try:
+            m = json.loads(line)
+        except ValueError:
+            return
+        self._busctl_failures = 0
+        payload = m.get("payload") if isinstance(m.get("payload"), dict) else {}
+        args = payload.get("data") if isinstance(payload.get("data"), list) else []
+        kind = m.get("type")
+        if kind == "method_call" and m.get("member") == "Notify":
+            self._remember_call(m.get("sender"), m.get("cookie"), args)
+        elif kind == "method_return":
+            call = self.calls.pop((m.get("destination"), m.get("reply_cookie")), None)
+            if call is not None and args and is_int(args[0]):
+                self._posted(args[0], call[0])
+        elif kind == "signal" and m.get("member") == "NotificationClosed":
+            if len(args) >= 2 and is_int(args[0]):
+                self._closed(args[0], args[1])
+
+    def _remember_call(self, sender, cookie, args):
+        if len(args) < 8:
+            return
+        now = time.monotonic()
+        if len(self.calls) > 64:
+            self.calls = {k: v for k, v in self.calls.items() if now - v[1] < 30}
+        self.calls[(sender, cookie)] = (args, now)
+
+    def _posted(self, nid, args):
+        app, _, icon, summary, body, _, hints = (args + [None] * 8)[:7]
+        app = app[:256] if isinstance(app, str) else ""
+        ignore = {a.casefold() for a in self.daemon.config["notifications"]["ignoreApps"]}
+        if app == APP_NAME or app.casefold() in ignore:
+            return
+        urgency = 1
+        if isinstance(hints, dict):
+            u = hints.get("urgency")
+            if isinstance(u, dict):
+                u = u.get("data")
+            if is_int(u):
+                urgency = u
+            # libnotify (notify-send -i) puts the icon in the image-path hint and leaves app_icon empty
+            image = hints.get("image-path")
+            if isinstance(image, dict):
+                image = image.get("data")
+            if not (isinstance(icon, str) and icon) and isinstance(image, str):
+                icon = image
+        n = {"id": nid, "app": app, "summary": summary[:NOTIFY_SUMMARY_MAX] if isinstance(summary, str) else "",
+             "body": strip_markup(body)[:NOTIFY_BODY_MAX] if isinstance(body, str) else "",
+             "urgency": self.URGENCY.get(urgency, "normal"), "time": now_ms()}
+        if isinstance(icon, str) and icon:
+            n["appIcon"] = icon[:1024]
+        self.store.pop(nid, None)
+        self.store[nid] = n
+        while len(self.store) > NOTIFY_KEEP:
+            self.store.pop(next(iter(self.store)))
+        self.spawn(self.broadcast("notifications.posted", n, phone_cap="mirror"))
+
+    def _closed(self, nid, reason):
+        if self.store.pop(nid, None) is None:
+            return
+        body = {"id": nid, "reason": self.CLOSE_REASONS.get(reason, "undefined")}
+        self.spawn(self.broadcast("notifications.closed", body, phone_cap="mirror"))
+
+    # dbus-monitor fallback. Its text format (one header line per message, values indented under it):
+    #   method call time=1.2 sender=:1.5 -> destination=:1.2 serial=9 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+    #      string "notify-send"
+    #      uint32 0
+    #      ...
+    #      int32 -1
+    #   method return time=1.3 sender=:1.2 -> destination=:1.5 serial=5 reply_serial=9
+    #      uint32 4
+    # A message's end is only known from what it contains, so each kind is parsed once its last value is in.
+
+    HEADER = re.compile(r"^(method call|method return|signal|error) time=\S+ sender=(\S+) -> destination=(\S+) "
+                        r"serial=(\d+)(?: reply_serial=(\d+))?(?: path=[^;]*; interface=[^;]*; member=(\w+))?")
+    NOTIFY_BODY = re.compile(r'   string "(.*?)"\n   uint32 (\d+)\n   string "(.*?)"\n   string "(.*?)"\n'
+                             r'   string "(.*?)"\n   array \[.*\n   int32 -?\d+$', re.S)
+
+    def _on_text_line(self, line):
+        st = self._text
+        h = self.HEADER.match(line)
+        if h:
+            kind, sender, dest, serial, reply, member = h.groups()
+            st["msg"] = {"kind": kind, "sender": sender, "dest": dest, "serial": int(serial),
+                         "reply": int(reply) if reply else None, "member": member, "lines": []}
+            return
+        m = st["msg"]
+        if m is None:
+            return
+        m["lines"].append(line)
+        if m["kind"] == "method call" and m["member"] == "Notify":
+            if re.fullmatch(r"   int32 -?\d+", line):
+                parsed = self.NOTIFY_BODY.match("\n".join(m["lines"]))
+                st["msg"] = None
+                if parsed:
+                    app, replaces, icon, summary, body = parsed.groups()
+                    text = "\n".join(m["lines"])
+                    urgency = re.search(r'string "urgency"\n\s+variant\s+byte (\d+)', text)
+                    image = re.search(r'string "image-path"\n\s+variant\s+string "(.*?)"\n', text)
+                    hints = {"urgency": int(urgency.group(1))} if urgency else {}
+                    if image:
+                        hints["image-path"] = image.group(1)
+                    self._remember_call(m["sender"], m["serial"], [app, int(replaces), icon, summary, body, [], hints, -1])
+        elif m["kind"] == "method return":
+            v = re.fullmatch(r"   uint32 (\d+)", line)
+            st["msg"] = None
+            call = self.calls.pop((m["dest"], m["reply"]), None)
+            if v and call is not None:
+                self._posted(int(v.group(1)), call[0])
+        elif m["kind"] == "signal" and m["member"] == "NotificationClosed":
+            values = [re.fullmatch(r"   uint32 (\d+)", ln) for ln in m["lines"]]
+            if len(values) >= 2:
+                st["msg"] = None
+                if all(values[:2]):
+                    self._closed(int(values[0].group(1)), int(values[1].group(1)))
+
+
+class MediaPlugin(Plugin):
+    """§8.2. Players from `playerctl --all-players --follow metadata --format ...` (one line per change;
+    re-list with `playerctl -l` and per-player `metadata`/`status`/`position` on each), debounced
+    MEDIA_DEBOUNCE. Volume from `wpctl get-volume @DEFAULT_AUDIO_SINK@` ("Volume: 0.45 [MUTED]"), re-read on
+    `pactl subscribe` sink events when pactl exists, else polled every 2 s while connected."""
+
+    name = "media"
+    any_tools = ("playerctl", "wpctl")
+
+    ACTIONS = {"play": "play", "pause": "pause", "playPause": "play-pause", "next": "next",
+               "previous": "previous", "stop": "stop"}
+    # Unit separator between fields: a title may hold tabs, never U+001F.
+    FORMAT = "\x1f".join(["{{status}}", "{{xesam:title}}", "{{xesam:artist}}", "{{xesam:album}}",
+                          "{{mpris:length}}", "{{position}}", "{{mpris:artUrl}}"])
+    MPRIS_CAPS = [("CanSeek", "canSeek"), ("CanGoNext", "canNext"), ("CanGoPrevious", "canPrevious"),
+                  ("CanPlay", "canPlay"), ("CanPause", "canPause")]
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.players = []
+        self.active = None
+        self.volume = None         # {volume, muted} or None
+        self._watchers = []
+        self._pending = set()
+        self._debounce = None
+        self._lock = asyncio.Lock()
+        self._last_key = None
+        self._last_playing = None
+        self._statuses = {}
+
+    def caps(self):
+        caps = []
+        if tool("playerctl"):
+            caps.append("players")
+        if tool("wpctl"):
+            caps.append("volume")
+        return caps
+
+    async def start(self):
+        playerctl, wpctl, pactl = tool("playerctl"), tool("wpctl"), tool("pactl")
+        if playerctl:
+            w = LineProcess("playerctl", lambda: [tool("playerctl") or playerctl, "--all-players", "--follow", "metadata",
+                                                  "--format", "{{playerName}}\x1f{{status}}\x1f{{xesam:title}}"],
+                            lambda line: self._schedule("players"))
+            w.start()
+            self._watchers.append(w)
+        if wpctl:
+            if pactl:
+                w = LineProcess("pactl subscribe", lambda: [tool("pactl") or pactl, "subscribe"],
+                                lambda line: self._schedule("volume") if " sink" in line or " server" in line else None)
+                w.start()
+                self._watchers.append(w)
+            else:
+                self.spawn(self._poll_volume())
+        await self.refresh_players(push=False)
+        await self.refresh_volume(push=False)
+
+    async def stop(self):
+        for w in self._watchers:
+            await w.stop()
+        self._watchers = []
+        if self._debounce is not None:
+            self._debounce.cancel()
+            self._debounce = None
+        self._last_key = None
+
+    async def on_ready(self, conn):
+        caps = conn.plugins["media"]["caps"]
+        if "players" in caps:
+            await conn.send("media.players", self._players_body())
+        if "volume" in caps and self.volume is not None:
+            await conn.send("media.volume", self.volume)
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        b = msg["body"]
+        if t == "media.players":
+            if not tool("playerctl"):
+                return {"players": []}
+            return await self.refresh_players(push=False)
+        if t == "media.control":
+            playerctl = self._need("playerctl")
+            action = b.get("action")
+            if action not in self.ACTIONS:
+                raise LinkError(ERR_INVALID_ARGUMENT, f"Unknown media action {action!r}; use one of {', '.join(self.ACTIONS)}.")
+            player = await self._player_arg(b)
+            rc, _, _ = await run_tool([playerctl, f"--player={player}", self.ACTIONS[action]], timeout=5)
+            self._schedule("players")
+            return {"ok": rc == 0}
+        if t == "media.seek":
+            playerctl = self._need("playerctl")
+            position = b.get("position")
+            if not is_int(position) or position < 0:
+                raise LinkError(ERR_INVALID_ARGUMENT, "media.seek needs \"position\", milliseconds from the start.")
+            player = await self._player_arg(b)
+            rc, _, _ = await run_tool([playerctl, f"--player={player}", "position", f"{position / 1000:.3f}"], timeout=5)
+            # A seek changes nothing --follow reports, so push the new position now.
+            await self.refresh_players(push=True, force=True)
+            return {"ok": rc == 0}
+        if t == "media.volume":
+            self._need("wpctl")
+            v = await self.refresh_volume(push=False)
+            if v is None:
+                raise LinkError(ERR_FAILED, "Could not read the volume with wpctl; is PipeWire running?")
+            return v
+        if t == "media.setVolume":
+            wpctl = self._need("wpctl")
+            volume, muted = b.get("volume"), b.get("muted")
+            if volume is None and muted is None:
+                raise LinkError(ERR_INVALID_ARGUMENT, "media.setVolume needs \"volume\", \"muted\" or both.")
+            if volume is not None and not is_number(volume):
+                raise LinkError(ERR_INVALID_ARGUMENT, "\"volume\" must be a number, 0.0 to 1.5.")
+            if muted is not None and not isinstance(muted, bool):
+                raise LinkError(ERR_INVALID_ARGUMENT, "\"muted\" must be true or false.")
+            if volume is not None:
+                rc, _, err = await run_tool([wpctl, "set-volume", "@DEFAULT_AUDIO_SINK@", f"{min(max(volume, 0.0), 1.5):.4f}"], timeout=5)
+                if rc != 0:
+                    raise LinkError(ERR_FAILED, f"wpctl could not set the volume: {err.decode(errors='replace').strip()}",
+                                    details={"exitCode": rc})
+            if muted is not None:
+                rc, _, err = await run_tool([wpctl, "set-mute", "@DEFAULT_AUDIO_SINK@", "1" if muted else "0"], timeout=5)
+                if rc != 0:
+                    raise LinkError(ERR_FAILED, f"wpctl could not change mute: {err.decode(errors='replace').strip()}",
+                                    details={"exitCode": rc})
+            v = await self.refresh_volume(push=True)
+            if v is None:
+                raise LinkError(ERR_FAILED, "Could not read the volume back with wpctl.")
+            return v
+        return await super().handle(conn, msg, data)
+
+    def _need(self, name):
+        path = tool(name)
+        if not path:
+            raise LinkError(ERR_PLUGIN_UNAVAILABLE, f"{name} is not installed on the desktop.")
+        return path
+
+    async def _player_arg(self, body):
+        player = body.get("player")
+        await self.refresh_players(push=False)
+        if player is None:
+            if self.active is None:
+                raise LinkError(ERR_NOT_FOUND, "No media player is running.")
+            return self.active
+        if not isinstance(player, str) or player not in {p["name"] for p in self.players}:
+            raise LinkError(ERR_NOT_FOUND, f"No media player named {player!r}.")
+        return player
+
+    def _schedule(self, what):
+        self._pending.add(what)
+        if self._debounce is None and self.running:
+            self._debounce = asyncio.get_running_loop().call_later(MEDIA_DEBOUNCE, self._flush)
+
+    def _flush(self):
+        self._debounce = None
+        what, self._pending = self._pending, set()
+        if "players" in what:
+            self.spawn(self.refresh_players(push=True))
+        if "volume" in what:
+            self.spawn(self.refresh_volume(push=True))
+
+    async def _poll_volume(self):
+        while True:
+            await asyncio.sleep(2)
+            await self.refresh_volume(push=True)
+
+    def _players_body(self):
+        body = {"players": self.players}
+        if self.active is not None:
+            body["active"] = self.active
+        return body
+
+    async def refresh_players(self, push=True, force=False):
+        """Re-read every player; push media.players when something other than the position changed."""
+        async with self._lock:
+            players = await self._read_players()
+            for p in players:
+                if p["status"] == "playing" and self._statuses.get(p["name"]) != "playing":
+                    self._last_playing = p["name"]
+            self._statuses = {p["name"]: p["status"] for p in players}
+            names = [p["name"] for p in players]
+            playing = [n for n in names if self._statuses[n] == "playing"]
+            if self._last_playing in playing:
+                active = self._last_playing
+            elif playing:
+                active = playing[0]
+            elif self._last_playing in names:
+                active = self._last_playing
+            else:
+                active = names[0] if names else None
+            self.players, self.active = players, active
+            body = self._players_body()
+            key = json.dumps([{k: v for k, v in p.items() if k not in ("position", "positionTime")} for p in players]
+                             + [active], sort_keys=True)
+            changed = key != self._last_key
+            self._last_key = key
+        if push and (changed or force):
+            await self.broadcast("media.players", body)
+        return body
+
+    async def _read_players(self):
+        playerctl = tool("playerctl")
+        if not playerctl:
+            return []
+        try:
+            rc, out, _ = await run_tool([playerctl, "-l"], timeout=5)
+        except LinkError:
+            return []
+        if rc != 0:
+            return []
+        names = [n.strip() for n in out.decode("utf-8", "replace").splitlines()]
+        names = [n for n in dict.fromkeys(names) if n and n != "playerctld"]
+        results = await asyncio.gather(*(self._read_player(playerctl, n) for n in names), return_exceptions=True)
+        return [r for r in results if isinstance(r, dict)]
+
+    async def _read_player(self, playerctl, name):
+        rc, out, _ = await run_tool([playerctl, f"--player={name}", "metadata", "--format", self.FORMAT], timeout=5)
+        sampled = now_ms()
+        if rc == 0:
+            parts = out.decode("utf-8", "replace").rstrip("\n").split("\x1f")
+        else:
+            # No metadata (a stopped player): its status alone
+            rc, out, _ = await run_tool([playerctl, f"--player={name}", "status"], timeout=5)
+            if rc != 0:
+                return None
+            parts = [out.decode("utf-8", "replace").strip()]
+        parts += [""] * (7 - len(parts))
+        status = parts[0].strip().lower()
+        player = {"name": name, "identity": name, "status": status if status in ("playing", "paused") else "stopped",
+                  "title": parts[1], "artist": parts[2], "album": parts[3], "positionTime": sampled}
+        for field, raw in (("length", parts[4]), ("position", parts[5])):
+            try:
+                player[field] = max(int(float(raw.strip())) // 1000, 0)
+            except ValueError:
+                pass
+        if parts[6].strip():
+            player["artUrl"] = parts[6].strip()
+        for _, key in self.MPRIS_CAPS:
+            player[key] = True
+        player.update(await self._mpris_props(name))
+        return player
+
+    async def _mpris_props(self, name):
+        """Identity and the Can* flags, which playerctl's format cannot show, read with busctl."""
+        busctl = tool("busctl")
+        if not busctl:
+            return {}
+        dest = f"org.mpris.MediaPlayer2.{name}"
+        props = {}
+        try:
+            rc, out, _ = await run_tool([busctl, "--user", "--json=short", "get-property", dest, "/org/mpris/MediaPlayer2",
+                                         "org.mpris.MediaPlayer2.Player"] + [p for p, _ in self.MPRIS_CAPS], timeout=3)
+            if rc == 0:
+                values = [json.loads(ln) for ln in out.decode().splitlines() if ln.strip()]
+                for (_, key), v in zip(self.MPRIS_CAPS, values):
+                    if isinstance(v, dict) and isinstance(v.get("data"), bool):
+                        props[key] = v["data"]
+            rc, out, _ = await run_tool([busctl, "--user", "--json=short", "get-property", dest, "/org/mpris/MediaPlayer2",
+                                         "org.mpris.MediaPlayer2", "Identity"], timeout=3)
+            if rc == 0:
+                v = json.loads(out.decode().splitlines()[0])
+                if isinstance(v, dict) and isinstance(v.get("data"), str) and v["data"]:
+                    props["identity"] = v["data"]
+        except (LinkError, ValueError, IndexError):
+            pass
+        return props
+
+    async def read_volume(self):
+        """{volume, muted} of the default sink, or None."""
+        wpctl = tool("wpctl")
+        if not wpctl:
+            return None
+        try:
+            rc, out, _ = await run_tool([wpctl, "get-volume", "@DEFAULT_AUDIO_SINK@"], timeout=5)
+        except LinkError:
+            return None
+        text = out.decode("utf-8", "replace")
+        m = re.search(r"Volume:\s*([0-9.]+)", text)
+        if rc != 0 or not m:
+            return None
+        return {"volume": round(float(m.group(1)), 4), "muted": "[MUTED]" in text}
+
+    async def refresh_volume(self, push=True):
+        v = await self.read_volume()
+        changed = v != self.volume
+        self.volume = v
+        if push and changed and v is not None:
+            await self.broadcast("media.volume", v)
+            status = self.daemon.plugins.get("status")
+            if status is not None and status.running:
+                await status.refresh()
+        return v
+
+
+class CommandsPlugin(Plugin):
+    """§8.3. Built-ins plus commands.json. Runs `exec` (a list = argv, a string = `sh -c`), never anything the
+    phone sent. Re-reads commands.json when its mtime changes (checked every 5 s and on commands.list) and
+    pushes commands.changed. Each run goes through `systemd-run --user --scope` when available, so a command
+    outlives a daemon restart."""
+
+    name = "commands"
+
+    BUILTINS = [
+        # id, title, icon, confirm, exec, condition tool (None = always)
+        {"id": "lock", "title": "Lock", "icon": "lock", "confirm": False, "exec": ["ionix-lock"], "needs": "ionix-lock"},
+        {"id": "suspend", "title": "Suspend", "icon": "bedtime", "confirm": False, "exec": ["systemctl", "suspend"], "needs": "systemctl"},
+        {"id": "logout", "title": "Log out", "icon": "logout", "confirm": True, "exec": ["uwsm", "stop"], "needs": "uwsm"},
+        {"id": "reboot", "title": "Restart", "icon": "restart", "confirm": True, "exec": ["systemctl", "reboot"], "needs": "systemctl"},
+        {"id": "poweroff", "title": "Shut down", "icon": "power", "confirm": True, "exec": ["systemctl", "poweroff"], "needs": "systemctl"},
+        {"id": "screen-off", "title": "Screen off", "icon": "screen", "confirm": False, "exec": ["hyprctl", "dispatch", "dpms", "off"], "needs": "hyprctl"},
+    ]
+    ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.commands = {}         # id → {id, title, icon, confirm, group?, exec, timeout, showOutput, source}
+        self._mtime = None
+        self._running = set()      # waits on detached commands, so they are reaped
+
+    def load(self):
+        """Built-ins (those whose `needs` exists, group "System") merged with commands.json by id; a user entry with
+        `"hidden": true` removes one. Invalid entries are logged and skipped."""
+        commands = {}
+        for b in self.BUILTINS:
+            if not tool(b["needs"]):
+                continue
+            if b["id"] == "screen-off" and not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+                continue
+            commands[b["id"]] = {"id": b["id"], "title": b["title"], "icon": b["icon"], "confirm": b["confirm"],
+                                 "group": "System", "exec": list(b["exec"]), "timeout": COMMAND_TIMEOUT,
+                                 "showOutput": False, "source": "builtin"}
+        path = self.daemon.paths.commands_file
+        self._mtime = self._stat()
+        data = read_json(path, {})
+        entries = data.get("commands") if isinstance(data.get("commands"), list) else []
+        for i, e in enumerate(entries):
+            where = f"{path}: command {i + 1}"
+            if not isinstance(e, dict):
+                log(f"{where} is not an object; skipped.")
+                continue
+            cid = e.get("id")
+            if not isinstance(cid, str) or not self.ID.fullmatch(cid):
+                log(f"{where}: \"id\" must match [a-z0-9][a-z0-9._-]* (64 at most); skipped.")
+                continue
+            if e.get("hidden") is True:
+                commands.pop(cid, None)
+                continue
+            # A user entry with a built-in's id starts from that built-in, so a title or confirm can change alone.
+            base = dict(commands.get(cid) or {"id": cid, "icon": "terminal", "confirm": False,
+                                              "timeout": COMMAND_TIMEOUT, "showOutput": False})
+            for key, kind in (("title", str), ("icon", str), ("group", str), ("confirm", bool), ("showOutput", bool)):
+                if key in e:
+                    if isinstance(e[key], kind):
+                        base[key] = e[key]
+                    else:
+                        log(f"{where}: \"{key}\" has the wrong type; ignored.")
+            if "exec" in e:
+                ex = e["exec"]
+                if isinstance(ex, str) and ex.strip():
+                    base["exec"] = ex
+                elif isinstance(ex, list) and ex and all(isinstance(a, str) for a in ex):
+                    base["exec"] = list(ex)
+                else:
+                    log(f"{where}: \"exec\" must be a non-empty string or list of strings; skipped.")
+                    continue
+            if "timeout" in e:
+                if is_number(e["timeout"]) and e["timeout"] > 0:
+                    base["timeout"] = min(float(e["timeout"]), COMMAND_TIMEOUT_MAX)
+                else:
+                    log(f"{where}: \"timeout\" must be a positive number of seconds; using {COMMAND_TIMEOUT}.")
+            if "exec" not in base or not base.get("title"):
+                log(f"{where}: needs \"title\" and \"exec\"; skipped.")
+                continue
+            base["source"] = "user"
+            commands[cid] = base
+        self.commands = commands
+
+    def _stat(self):
+        try:
+            st = os.stat(self.daemon.paths.commands_file)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    async def check_reload(self):
+        """Reload commands.json if it changed on disk; push commands.changed then."""
+        if self._stat() != self._mtime:
+            self.load()
+            log("commands.json changed; reloaded.", debug=True)
+            await self.broadcast("commands.changed", {})
+
+    async def start(self):
+        self.spawn(self._watch())
+
+    async def _watch(self):
+        while True:
+            await asyncio.sleep(5)
+            await self.check_reload()
+
+    def public(self, c):
+        """A Command as the phone sees it."""
+        out = {"id": c["id"], "title": c["title"], "icon": c["icon"], "confirm": c["confirm"]}
+        if c.get("group"):
+            out["group"] = c["group"]
+        return out
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        if t == "commands.list":
+            await self.check_reload()
+            return {"commands": [self.public(c) for c in self.commands.values()]}
+        if t == "commands.run":
+            cid = msg["body"].get("id")
+            if not isinstance(cid, str):
+                raise LinkError(ERR_INVALID_ARGUMENT, "commands.run needs \"id\", a command id.")
+            command = self.commands.get(cid)
+            if command is None:
+                raise LinkError(ERR_NOT_FOUND, f"No command with id \"{cid}\".")
+            log(f"{conn.label()} runs command {cid}.")
+            return await self.run(command)
+        return await super().handle(conn, msg, data)
+
+    def argv(self, command):
+        """The argv a command runs, its program resolved through tool() so tests can fake it."""
+        ex = command["exec"]
+        argv = ["sh", "-c", ex] if isinstance(ex, str) else list(ex)
+        if "/" not in argv[0]:
+            argv[0] = tool(argv[0]) or argv[0]
+        return argv
+
+    async def run(self, command):
+        argv = self.argv(command)
+        systemd_run = tool("systemd-run")
+        if systemd_run and os.environ.get("XDG_RUNTIME_DIR"):
+            argv = [systemd_run, "--user", "--scope", "--quiet", "--collect", "--"] + argv
+        show = command.get("showOutput") is True
+        # Output goes to an unlinked file, not a pipe: a detached command must never die of SIGPIPE when we stop reading.
+        out = tempfile.TemporaryFile() if show else None
+        try:
+            proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.DEVNULL,
+                                                        stdout=out or asyncio.subprocess.DEVNULL,
+                                                        stderr=out or asyncio.subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            if out:
+                out.close()
+            raise LinkError(ERR_FAILED, f"Could not run command \"{command['id']}\": {e.strerror or e}.")
+        try:
+            rc = await asyncio.wait_for(asyncio.shield(proc.wait()), command.get("timeout", COMMAND_TIMEOUT))
+        except TimeoutError:
+            rc = None
+            waiter = asyncio.create_task(proc.wait())
+            self._running.add(waiter)
+            waiter.add_done_callback(self._running.discard)
+        reply = {"ok": rc is None or rc == 0, "detached": rc is None}
+        if rc is not None:
+            reply["exitCode"] = rc if rc >= 0 else 128 - rc
+        if out:
+            try:
+                size = out.seek(0, os.SEEK_END)
+                out.seek(max(0, size - COMMAND_OUTPUT_TAIL))
+                tail = out.read(COMMAND_OUTPUT_TAIL)
+                reply["output"] = tail.decode("utf-8", "replace")
+            finally:
+                out.close()
+        return reply
+
+
+class ClipboardPlugin(Plugin):
+    """§8.4. wl-copy / wl-paste --no-newline --type text."""
+
+    name = "clipboard"
+    tools = ("wl-copy", "wl-paste")
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        if t == "clipboard.push":
+            text = msg["body"].get("text")
+            if not isinstance(text, str):
+                raise LinkError(ERR_INVALID_ARGUMENT, "clipboard.push needs \"text\".")
+            raw = text.encode("utf-8")
+            if len(raw) > MAX_TEXT:
+                raise LinkError(ERR_INVALID_ARGUMENT, f"Clipboard text is over {MAX_TEXT // 1024} KiB.")
+            wl_copy = tool("wl-copy")
+            if not wl_copy:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, "wl-copy is not installed on the desktop.")
+            # wl-copy forks a child that serves the clipboard and keeps any pipe it was given, so no capture.
+            rc, _, _ = await run_tool([wl_copy, "--type", "text/plain"], stdin=raw, timeout=5, capture=False)
+            return {"ok": rc == 0}
+        if t == "clipboard.pull":
+            wl_paste = tool("wl-paste")
+            if not wl_paste:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, "wl-paste is not installed on the desktop.")
+            rc, out, _ = await run_tool([wl_paste, "--no-newline", "--type", "text"], timeout=5)
+            if rc != 0:
+                return {"text": ""}
+            # §2: cut so even a text of control characters (escaped 6×) fits one JSON message.
+            return {"text": fit_json_text(truncate_utf8(out, MAX_TEXT), MAX_JSON - 1024)}
+        return await super().handle(conn, msg, data)
+
+    async def push_to(self, conn, text):
+        """Desktop → phone, for `ionix-link send-clipboard`."""
+        if len(text.encode("utf-8")) > MAX_TEXT:
+            raise LinkError(ERR_INVALID_ARGUMENT, f"The text is over {MAX_TEXT // 1024} KiB, the most a phone takes.")
+        if not await conn.send("clipboard.push", {"text": fit_json_text(text, MAX_JSON - 1024)}):
+            raise LinkError(CERR_NOT_CONNECTED, "The phone disconnected.")
+
+
+def truncate_utf8(raw, limit):
+    """Decode `raw`, cut to at most `limit` bytes on a character boundary."""
+    return raw[:limit].decode("utf-8", "ignore") if len(raw) > limit else raw.decode("utf-8", "replace")
+
+
+class _WaylandProtocol(asyncio.Protocol):
+    def __init__(self, pointer):
+        self.pointer = pointer
+
+    def data_received(self, data):
+        self.pointer._on_data(data)
+
+    def connection_lost(self, exc):
+        self.pointer._on_lost(exc)
+
+
+class VirtualPointer:
+    """Minimal Wayland client: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY, binds wl_seat and
+    zwlr_virtual_pointer_manager_v1, creates one zwlr_virtual_pointer_v1 and keeps it for the daemon's life
+    (one long-lived device; a device per event loses button events).
+
+    Wire format (native byte order, little-endian on every target): header = u32 object id, u32 (size << 16 |
+    opcode); args are u32/i32, fixed = i32 of value*256, string = u32 length incl. NUL + bytes padded to 4,
+    new_id for wl_registry.bind = string interface, u32 version, u32 id. Opcodes, checked against
+    wlr-virtual-pointer-unstable-v1.xml (version 2) and wayland.xml:
+      wl_display:   req 0 sync(new_id), 1 get_registry(new_id); ev 0 error(obj, u32, str), 1 delete_id(u32)
+      wl_registry:  req 0 bind(u32 name, new_id); ev 0 global(u32 name, str iface, u32 version), 1 global_remove
+      wl_callback:  ev 0 done(u32)
+      manager v1/2: req 0 create_virtual_pointer(obj seat|0, new_id), 1 destroy, 2 create_virtual_pointer_with_output (v2)
+      pointer:      req 0 motion(u32 time, fixed dx, fixed dy), 1 motion_absolute(u32 time, u32 x, u32 y,
+                    u32 x_extent, u32 y_extent), 2 button(u32 time, u32 button, u32 state), 3 axis(u32 time,
+                    u32 axis, fixed value), 4 frame, 5 axis_source(u32), 6 axis_stop(u32 time, u32 axis),
+                    7 axis_discrete(...), 8 destroy
+    Buttons BTN_LEFT 0x110, BTN_RIGHT 0x111, BTN_MIDDLE 0x112; state 1 pressed / 0 released; axis 0 vertical,
+    1 horizontal; axis_source finger = 1. Every event group ends with `frame`. Absolute moves use the bounding
+    box of all outputs (from ScreenPlugin.outputs) as the extent. Reconnects lazily if the compositor restarts.
+    """
+
+    BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
+    AXIS_SOURCE_FINGER = 1
+    SCROLL_STOP = 0.15             # s without scrolling → axis_stop, which ends kinetic scrolling cleanly
+    RETRY = 30                     # s after a failed connect before available() offers the pointer again
+
+    def __init__(self):
+        self.ready = False
+        self.transport = None
+        self.failed_at = None
+        self._buf = bytearray()
+        self._next_id = 2
+        self._registry = None
+        self._globals = {}         # interface → (name, version)
+        self._callbacks = {}       # wl_callback id → Future
+        self._pointer = None
+        self._scrolling = set()
+        self._scroll_timer = None
+        self._connecting = None
+
+    def socket_path(self):
+        display = os.environ.get("WAYLAND_DISPLAY", "")
+        if not display:
+            return None
+        if os.path.isabs(display):
+            return display
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+        return os.path.join(runtime, display) if runtime else None
+
+    def may_connect(self):
+        """Whether a connect is worth trying: the socket exists and no recent attempt failed."""
+        path = self.socket_path()
+        if not path or not os.path.exists(path):
+            return False
+        return self.failed_at is None or time.monotonic() - self.failed_at > self.RETRY
+
+    async def connect(self):
+        """Connect and bind; returns False (and stays unavailable) when the global is missing."""
+        if self.ready:
+            return True
+        if self._connecting is not None:
+            return await asyncio.shield(self._connecting)
+        self._connecting = asyncio.get_running_loop().create_future()
+        try:
+            ok = await self._connect()
+        except Exception:
+            log(f"Virtual pointer: connect failed:\n{traceback.format_exc()}")
+            ok = False
+        if not ok:
+            self.failed_at = time.monotonic()
+            self.close()
+        self._connecting.set_result(ok)
+        self._connecting = None
+        return ok
+
+    async def _connect(self):
+        path = self.socket_path()
+        if not path or not os.path.exists(path):
+            log("Virtual pointer: no Wayland socket (WAYLAND_DISPLAY); the pointer is unavailable.", debug=True)
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            self.transport, _ = await asyncio.wait_for(
+                loop.create_unix_connection(lambda: _WaylandProtocol(self), path), 3)
+        except (OSError, TimeoutError) as e:
+            log(f"Virtual pointer: cannot connect to {path}: {e}.")
+            return False
+        self._buf.clear()
+        self._next_id = 2
+        self._globals = {}
+        self._callbacks = {}
+        self._registry = self._new_id()
+        self._send(1, 1, struct.pack("=I", self._registry))
+        await self._roundtrip()
+        manager = self._globals.get("zwlr_virtual_pointer_manager_v1")
+        if manager is None:
+            log("Virtual pointer: the compositor has no zwlr_virtual_pointer_manager_v1; the pointer is unavailable.")
+            return False
+        seat_id = 0
+        seat = self._globals.get("wl_seat")
+        if seat is not None:
+            seat_id = self._bind(seat[0], "wl_seat", 1)
+        manager_id = self._bind(manager[0], "zwlr_virtual_pointer_manager_v1", 1)
+        self._pointer = self._new_id()
+        self._send(manager_id, 0, struct.pack("=II", seat_id, self._pointer))
+        await self._roundtrip()    # a protocol error arrives before this callback's done
+        if self.transport is None:
+            return False
+        self.ready = True
+        log("Virtual pointer ready.", debug=True)
+        return True
+
+    def close(self):
+        self.ready = False
+        if self._scroll_timer is not None:
+            self._scroll_timer.cancel()
+            self._scroll_timer = None
+        if self.transport is not None:
+            transport, self.transport = self.transport, None
+            transport.close()
+
+    def _new_id(self):
+        oid = self._next_id
+        self._next_id += 1
+        return oid
+
+    @staticmethod
+    def _string(s):
+        raw = s.encode("utf-8") + b"\0"
+        return struct.pack("=I", len(raw)) + raw + b"\0" * (-len(raw) % 4)
+
+    def _send(self, obj, opcode, payload=b""):
+        if self.transport is None:
+            return
+        size = 8 + len(payload)
+        self.transport.write(struct.pack("=II", obj, (size << 16) | opcode) + payload)
+
+    def _bind(self, name, interface, version):
+        oid = self._new_id()
+        self._send(self._registry, 0, struct.pack("=I", name) + self._string(interface) + struct.pack("=II", version, oid))
+        return oid
+
+    async def _roundtrip(self):
+        cb = self._new_id()
+        fut = asyncio.get_running_loop().create_future()
+        self._callbacks[cb] = fut
+        self._send(1, 0, struct.pack("=I", cb))
+        try:
+            await asyncio.wait_for(fut, 3)
+        except (TimeoutError, ConnectionError):
+            self.close()
+        finally:
+            self._callbacks.pop(cb, None)
+
+    def _on_data(self, data):
+        self._buf += data
+        while len(self._buf) >= 8:
+            obj, word = struct.unpack_from("=II", self._buf)
+            size, opcode = word >> 16, word & 0xFFFF
+            if size < 8:
+                log("Virtual pointer: malformed message from the compositor.")
+                self.close()
+                return
+            if len(self._buf) < size:
+                return
+            args = bytes(self._buf[8:size])
+            del self._buf[:size]
+            self._dispatch(obj, opcode, args)
+
+    @staticmethod
+    def _read_string(args, offset):
+        length = struct.unpack_from("=I", args, offset)[0]
+        raw = args[offset + 4:offset + 4 + length]
+        return raw.rstrip(b"\0").decode("utf-8", "replace"), offset + 4 + length + (-length % 4)
+
+    def _dispatch(self, obj, opcode, args):
+        if obj == 1 and opcode == 0:
+            bad, code = struct.unpack_from("=II", args)
+            text, _ = self._read_string(args, 8)
+            log(f"Virtual pointer: Wayland error on object {bad} (code {code}): {text}")
+            self.close()
+            for fut in self._callbacks.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError(text))
+        elif obj == self._registry and opcode == 0:
+            name = struct.unpack_from("=I", args)[0]
+            interface, offset = self._read_string(args, 4)
+            version = struct.unpack_from("=I", args, offset)[0]
+            self._globals.setdefault(interface, (name, version))
+        elif obj in self._callbacks and opcode == 0:
+            fut = self._callbacks[obj]
+            if not fut.done():
+                fut.set_result(True)
+
+    def _on_lost(self, exc):
+        if self.ready:
+            log("Virtual pointer: compositor connection lost; it reconnects on the next input.")
+        self.ready = False
+        self.transport = None
+        self.failed_at = None
+        for fut in self._callbacks.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("lost"))
+
+    @staticmethod
+    def _time():
+        return int(time.monotonic() * 1000) & 0xFFFFFFFF
+
+    @staticmethod
+    def _fixed(v):
+        return max(-0x80000000, min(0x7FFFFFFF, int(round(v * 256))))
+
+    def _frame(self):
+        self._send(self._pointer, 4)
+
+    def move(self, dx, dy):
+        if not self.ready:
+            return
+        self._send(self._pointer, 0, struct.pack("=Iii", self._time(), self._fixed(dx), self._fixed(dy)))
+        self._frame()
+
+    def move_absolute(self, x, y, x_extent, y_extent):
+        if not self.ready:
+            return
+        self._send(self._pointer, 1, struct.pack("=IIIII", self._time(), x, y, x_extent, y_extent))
+        self._frame()
+
+    def button(self, button, pressed):
+        if not self.ready:
+            return
+        self._send(self._pointer, 2, struct.pack("=III", self._time(), button, 1 if pressed else 0))
+        self._frame()
+
+    def scroll(self, dx, dy):
+        if not self.ready or (not dx and not dy):
+            return
+        t = self._time()
+        self._send(self._pointer, 5, struct.pack("=I", self.AXIS_SOURCE_FINGER))
+        if dy:
+            self._send(self._pointer, 3, struct.pack("=IIi", t, 0, self._fixed(dy)))
+            self._scrolling.add(0)
+        if dx:
+            self._send(self._pointer, 3, struct.pack("=IIi", t, 1, self._fixed(dx)))
+            self._scrolling.add(1)
+        self._frame()
+        if self._scroll_timer is not None:
+            self._scroll_timer.cancel()
+        self._scroll_timer = asyncio.get_running_loop().call_later(self.SCROLL_STOP, self._scroll_stop)
+
+    def _scroll_stop(self):
+        self._scroll_timer = None
+        if not self.ready or not self._scrolling:
+            return
+        t = self._time()
+        self._send(self._pointer, 5, struct.pack("=I", self.AXIS_SOURCE_FINGER))
+        for axis in sorted(self._scrolling):
+            self._send(self._pointer, 6, struct.pack("=II", t, axis))
+        self._scrolling.clear()
+        self._frame()
+
+
+class InputPlugin(Plugin):
+    """§8.5. Pointer via VirtualPointer (cap "pointer" once connect() succeeded), keyboard via wtype (cap
+    "keyboard"). `input.key` → `wtype -M ctrl -k Return -m ctrl`; wtype's first key from a fresh virtual
+    keyboard is sometimes lost, so lead with a throwaway `-k Shift_L` in the same call. Sub-pixel move
+    remainders are kept per connection."""
+
+    name = "input"
+    MODIFIERS = {"ctrl": "ctrl", "alt": "alt", "shift": "shift", "super": "logo"}
+    KEY = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.pointer = VirtualPointer()
+        self.remainders = {}       # conn → [dx, dy] below wl_fixed's 1/256 px
+
+    def available(self):
+        if self.daemon.config["plugins"].get(self.name, True) is False:
+            return False
+        return bool(tool("wtype")) or self.pointer.ready or self.pointer.may_connect()
+
+    def caps(self):
+        caps = []
+        if self.pointer.ready:
+            caps.append("pointer")
+        if tool("wtype"):
+            caps.append("keyboard")
+        return caps
+
+    async def prepare(self):
+        if not self.pointer.ready and self.pointer.may_connect():
+            await self.pointer.connect()
+
+    async def start(self):
+        await self.prepare()
+
+    async def on_close(self, conn):
+        self.remainders.pop(conn, None)
+
+    def _pointer_ready(self):
+        """True when events can go out; otherwise starts a lazy reconnect and drops this event."""
+        if self.pointer.ready:
+            return True
+        if self.pointer.may_connect():
+            self.spawn(self.pointer.connect())
+        return False
+
+    @staticmethod
+    def _num(body, key):
+        v = body.get(key)
+        if not is_number(v):
+            raise LinkError(ERR_INVALID_ARGUMENT, f"\"{key}\" must be a number.")
+        return float(v)
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        b = msg["body"]
+        if t == "input.move":
+            dx, dy = self._num(b, "dx"), self._num(b, "dy")
+            if not self._pointer_ready():
+                return None
+            r = self.remainders.setdefault(conn, [0.0, 0.0])
+            x, y = dx + r[0], dy + r[1]
+            qx, qy = math.trunc(x * 256) / 256, math.trunc(y * 256) / 256
+            r[0], r[1] = x - qx, y - qy
+            if qx or qy:
+                self.pointer.move(qx, qy)
+            return None
+        if t == "input.moveAbsolute":
+            x, y = self._num(b, "x"), self._num(b, "y")
+            name = b.get("output")
+            if not self._pointer_ready():
+                return None
+            outputs = await self.daemon.plugins["screen"].outputs()
+            out = next((o for o in outputs if o["name"] == name), None)
+            if out is None:
+                return None
+            min_x = min(o["x"] for o in outputs)
+            min_y = min(o["y"] for o in outputs)
+            width = max(o["x"] + o["width"] for o in outputs) - min_x
+            height = max(o["y"] + o["height"] for o in outputs) - min_y
+            # In eighths of a pixel, so a big screen still gets sub-pixel placement.
+            px = (out["x"] - min_x + min(max(x, 0.0), 1.0) * out["width"]) * 8
+            py = (out["y"] - min_y + min(max(y, 0.0), 1.0) * out["height"]) * 8
+            ext_x, ext_y = max(width * 8, 1), max(height * 8, 1)
+            self.pointer.move_absolute(min(int(px), ext_x - 1), min(int(py), ext_y - 1), ext_x, ext_y)
+            return None
+        if t == "input.button":
+            button = VirtualPointer.BUTTONS.get(b.get("button"))
+            action = b.get("action")
+            if button is None or action not in ("down", "up", "click"):
+                raise LinkError(ERR_INVALID_ARGUMENT, "input.button needs \"button\" (left, right, middle) and "
+                                "\"action\" (down, up, click).")
+            if not self._pointer_ready():
+                return None
+            if action in ("down", "click"):
+                self.pointer.button(button, True)
+            if action in ("up", "click"):
+                self.pointer.button(button, False)
+            return None
+        if t == "input.scroll":
+            dx, dy = self._num(b, "dx"), self._num(b, "dy")
+            if self._pointer_ready():
+                self.pointer.scroll(dx, dy)
+            return None
+        if t == "input.text":
+            wtype = self._wtype()
+            text = b.get("text")
+            if not isinstance(text, str):
+                raise LinkError(ERR_INVALID_ARGUMENT, "input.text needs \"text\".")
+            raw = text.encode("utf-8")
+            if len(raw) > MAX_TEXT:
+                raise LinkError(ERR_INVALID_ARGUMENT, f"Text to type is over {MAX_TEXT // 1024} KiB.")
+            if not text:
+                return {"ok": True}
+            # From stdin (`-`): one argv string is capped at 128 KiB by the kernel.
+            rc, _, _ = await run_tool([wtype, "-k", "Shift_L", "-"], stdin=raw, timeout=min(300, 10 + len(raw) / 200))
+            return {"ok": rc == 0}
+        if t == "input.key":
+            wtype = self._wtype()
+            key = b.get("key")
+            modifiers = b.get("modifiers", [])
+            if not isinstance(key, str) or not self.KEY.fullmatch(key):
+                raise LinkError(ERR_INVALID_ARGUMENT, "input.key needs \"key\", an XKB keysym name such as Return or a.")
+            if not isinstance(modifiers, list) or any(m not in self.MODIFIERS for m in modifiers):
+                raise LinkError(ERR_INVALID_ARGUMENT, f"Unknown modifier in {modifiers!r}; use ctrl, alt, shift or super.")
+            mods = [self.MODIFIERS[m] for m in dict.fromkeys(modifiers)]
+            argv = [wtype, "-k", "Shift_L"]
+            for m in mods:
+                argv += ["-M", m]
+            argv += ["-k", key]
+            for m in reversed(mods):
+                argv += ["-m", m]
+            rc, _, _ = await run_tool(argv, timeout=5)
+            return {"ok": rc == 0}
+        return await super().handle(conn, msg, data)
+
+    @staticmethod
+    def _wtype():
+        wtype = tool("wtype")
+        if not wtype:
+            raise LinkError(ERR_PLUGIN_UNAVAILABLE, "wtype is not installed on the desktop, so it cannot type.")
+        return wtype
+
+
+class _Stream:
+    """One screen stream: what was asked, and the frame in flight."""
+
+    def __init__(self, conn, output, scale, quality, max_fps, size):
+        self.conn = conn
+        self.output = output
+        self.scale = scale
+        self.quality = quality
+        self.max_fps = max_fps
+        self.size = size           # (w, h) expected
+        self.seq = 0
+        self.acked = asyncio.Event()
+        self.acked.set()
+        self.task = None
+
+
+class ScreenPlugin(Plugin):
+    """§8.6. Outputs from `hyprctl monitors -j` (logical size = width/scale), else `wlr-randr --json`.
+    One stream per connection: capture `grim -o <output> -s <scale> -t jpeg -q <quality> -c -`, send as a
+    binary `screen.frame`, wait for `screen.ack` of that seq and 1/maxFps, repeat. Capture starts when the ack
+    is in and the interval is nearly over, so a slow link lowers the frame rate rather than showing old frames.
+    SCREEN_STALL s without an ack → screen.stopped "stalled"."""
+
+    name = "screen"
+    tools = ("grim",)
+    any_tools = ("hyprctl", "wlr-randr")
+    OUTPUTS_TTL = 2                # s an outputs list is reused
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.streams = {}          # conn → _Stream
+        self._locks = {}           # conn → Lock around screen.start / screen.stop
+        self._outputs = None
+        self._outputs_at = 0.0
+
+    def caps(self):
+        return ["jpeg"]
+
+    async def outputs(self, fresh=False):
+        """[{name, description, x, y, width, height, scale, focused}] in logical px."""
+        if not fresh and self._outputs is not None and time.monotonic() - self._outputs_at < self.OUTPUTS_TTL:
+            return self._outputs
+        outputs = []
+        hyprctl, wlr_randr = tool("hyprctl"), tool("wlr-randr")
+        try:
+            if hyprctl:
+                rc, out, _ = await run_tool([hyprctl, "monitors", "-j"], timeout=3)
+                if rc == 0:
+                    outputs = self._parse_hyprctl(json.loads(out))
+            if not outputs and wlr_randr:
+                rc, out, _ = await run_tool([wlr_randr, "--json"], timeout=3)
+                if rc == 0:
+                    outputs = self._parse_wlr_randr(json.loads(out))
+        except (LinkError, ValueError, TypeError, KeyError) as e:
+            log(f"Could not list outputs: {e}", debug=True)
+        self._outputs, self._outputs_at = outputs, time.monotonic()
+        return outputs
+
+    @staticmethod
+    def _logical(width, height, scale, transform):
+        scale = scale if is_number(scale) and scale > 0 else 1.0
+        w, h = round(width / scale), round(height / scale)
+        return (h, w) if is_int(transform) and transform % 2 == 1 else (w, h)
+
+    def _parse_hyprctl(self, monitors):
+        outputs = []
+        for m in monitors if isinstance(monitors, list) else []:
+            if not isinstance(m, dict) or m.get("disabled") is True or not isinstance(m.get("name"), str):
+                continue
+            w, h = self._logical(m.get("width", 0), m.get("height", 0), m.get("scale", 1), m.get("transform", 0))
+            outputs.append({"name": m["name"], "description": str(m.get("description", "")), "x": int(m.get("x", 0)),
+                            "y": int(m.get("y", 0)), "width": w, "height": h,
+                            "scale": float(m.get("scale", 1) or 1), "focused": m.get("focused") is True})
+        return outputs
+
+    def _parse_wlr_randr(self, heads):
+        outputs = []
+        for o in heads if isinstance(heads, list) else []:
+            if not isinstance(o, dict) or not o.get("enabled") or not isinstance(o.get("name"), str):
+                continue
+            mode = next((m for m in o.get("modes", []) if m.get("current")), None)
+            if mode is None:
+                continue
+            transform = {"90": 1, "270": 3, "flipped-90": 5, "flipped-270": 7}.get(str(o.get("transform")), 0)
+            w, h = self._logical(mode.get("width", 0), mode.get("height", 0), o.get("scale", 1), transform)
+            pos = o.get("position") or {}
+            outputs.append({"name": o["name"], "description": str(o.get("description", "")), "x": int(pos.get("x", 0)),
+                            "y": int(pos.get("y", 0)), "width": w, "height": h,
+                            "scale": float(o.get("scale", 1) or 1), "focused": False})
+        return outputs
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        b = msg["body"]
+        if t == "screen.outputs":
+            return {"outputs": await self.outputs(fresh=True)}
+        if t == "screen.start":
+            # One start or stop at a time per connection, so two quick starts cannot leave a stream orphaned.
+            async with self._lock_for(conn):
+                return await self._start(conn, b)
+        if t == "screen.ack":
+            stream = self.streams.get(conn)
+            if stream is not None and b.get("seq") == stream.seq:
+                stream.acked.set()
+            return None
+        if t == "screen.stop":
+            async with self._lock_for(conn):
+                await self._stop_stream(conn)
+            return {"ok": True}
+        return await super().handle(conn, msg, data)
+
+    def _lock_for(self, conn):
+        return self._locks.setdefault(conn, asyncio.Lock())
+
+    async def _start(self, conn, b):
+        name, scale, quality, max_fps = b.get("output"), b.get("scale"), b.get("quality"), b.get("maxFps")
+        out = next((o for o in await self.outputs(fresh=True) if o["name"] == name), None)
+        if out is None:
+            raise LinkError(ERR_INVALID_ARGUMENT, f"No output named {name!r}; screen.outputs lists them.")
+        if not is_number(scale) or not 0.1 <= scale <= 1.0:
+            raise LinkError(ERR_INVALID_ARGUMENT, "\"scale\" must be from 0.1 to 1.0.")
+        if not is_int(quality) or not 1 <= quality <= 100:
+            raise LinkError(ERR_INVALID_ARGUMENT, "\"quality\" must be an integer from 1 to 100.")
+        if not is_int(max_fps) or not 1 <= max_fps <= 30:
+            raise LinkError(ERR_INVALID_ARGUMENT, "\"maxFps\" must be an integer from 1 to 30.")
+        await self._stop_stream(conn)
+        if conn.state == "closed":
+            raise LinkError(CERR_NOT_CONNECTED, "The phone disconnected.")
+        size = (max(1, round(out["width"] * scale)), max(1, round(out["height"] * scale)))
+        stream = _Stream(conn, name, float(scale), quality, max_fps, size)
+        self.streams[conn] = stream
+        stream.task = conn.spawn(self._run(stream))
+        log(f"{conn.label()}: streaming {name} at {size[0]}x{size[1]}, up to {max_fps} fps.", debug=True)
+        return {"width": size[0], "height": size[1]}
+
+    async def on_close(self, conn):
+        async with self._lock_for(conn):
+            await self._stop_stream(conn)
+        self._locks.pop(conn, None)
+
+    async def _stop_stream(self, conn):
+        stream = self.streams.pop(conn, None)
+        if stream is not None and stream.task is not None and stream.task is not asyncio.current_task():
+            stream.task.cancel()
+            try:
+                await stream.task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _stopped(self, stream, reason):
+        if self.streams.get(stream.conn) is stream:
+            del self.streams[stream.conn]
+        log(f"{stream.conn.label()}: stream of {stream.output} stopped ({reason}).", debug=True)
+        await stream.conn.send("screen.stopped", {"reason": reason})
+
+    async def _run(self, s):
+        grim = tool("grim")
+        interval = 1.0 / s.max_fps
+        last_sent = -interval
+        estimate = 0.05            # s a capture takes, averaged
+        failures = 0
+        while True:
+            if not s.acked.is_set():
+                try:
+                    await asyncio.wait_for(s.acked.wait(), SCREEN_STALL)
+                except TimeoutError:
+                    await self._stopped(s, "stalled")
+                    return
+            delay = last_sent + interval - estimate - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            started, taken = time.monotonic(), now_ms()
+            try:
+                rc, jpeg, err = await run_tool([grim or "grim", "-o", s.output, "-s", f"{s.scale:g}", "-t", "jpeg",
+                                                "-q", str(s.quality), "-c", "-"], timeout=10)
+            except LinkError as e:
+                rc, jpeg, err = -1, b"", e.message.encode()
+            estimate = 0.7 * estimate + 0.3 * (time.monotonic() - started)
+            if rc != 0 or not jpeg.startswith(b"\xff\xd8") or len(jpeg) > MAX_FRAME - 1024:
+                failures += 1
+                log(f"grim failed on {s.output} (status {rc}): {err.decode(errors='replace').strip()[:200]}", debug=True)
+                if s.output not in {o["name"] for o in await self.outputs(fresh=True)}:
+                    await self._stopped(s, "output_gone")
+                    return
+                if failures >= 3:
+                    await self._stopped(s, "capture_failed")
+                    return
+                await asyncio.sleep(0.5)
+                continue
+            failures = 0
+            delay = last_sent + interval - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            w, h = jpeg_size(jpeg) or s.size
+            s.seq += 1
+            s.acked.clear()
+            body = {"output": s.output, "w": w, "h": h, "seq": s.seq, "format": "jpeg", "time": taken}
+            if not await s.conn.send("screen.frame", body, data=jpeg):
+                return
+            last_sent = time.monotonic()
+
+
+class StatusPlugin(Plugin):
+    """§8.7. Phone battery into state.json; host status (hostname, /sys/class/power_supply/BAT*, volume from
+    MediaPlugin when available) pushed after ready and on change (battery polled every 60 s); status.ring for
+    the CLI; status.ping both ways (show it with notify-send)."""
+
+    name = "status"
+    POLL = 60
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self._last = None
+
+    def caps(self):
+        caps = []
+        if self.read_battery() is not None:
+            caps.append("battery")
+        if tool("wpctl"):
+            caps.append("volume")
+        return caps
+
+    def read_battery(self):
+        """{level, charging} of the first battery in sysfs, or None."""
+        for path in sorted(glob.glob(os.path.join(self.daemon.paths.power_supply_dir, "BAT*"))):
+            try:
+                with open(os.path.join(path, "capacity")) as f:
+                    level = int(f.read().strip())
+                with open(os.path.join(path, "status")) as f:
+                    status = f.read().strip()
+            except (OSError, ValueError):
+                continue
+            return {"level": min(max(level, 0), 100), "charging": status in ("Charging", "Full")}
+        return None
+
+    async def host_status(self):
+        body = {"hostName": self.daemon.host_name()}
+        battery = self.read_battery()
+        if battery is not None:
+            body["battery"] = battery
+        media = self.daemon.plugins.get("media")
+        volume = media.volume if media is not None and media.running else None
+        if volume is None and media is not None:
+            volume = await media.read_volume()
+        if volume is not None:
+            body["volume"] = volume["volume"]
+            body["muted"] = volume["muted"]
+        return body
+
+    async def refresh(self):
+        """Push status.host when it changed since the last push."""
+        body = await self.host_status()
+        if body != self._last:
+            self._last = body
+            await self.broadcast("status.host", body)
+
+    async def start(self):
+        self.spawn(self._poll())
+
+    async def stop(self):
+        self._last = None
+
+    async def _poll(self):
+        while True:
+            await asyncio.sleep(self.POLL)
+            await self.refresh()
+
+    async def on_ready(self, conn):
+        body = await self.host_status()
+        self._last = body
+        await conn.send("status.host", body)
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        b = msg["body"]
+        if t == "status.battery":
+            level, charging = b.get("level"), b.get("charging")
+            if not is_int(level) or not isinstance(charging, bool):
+                raise LinkError(ERR_INVALID_ARGUMENT, "status.battery needs \"level\" (0..100) and \"charging\".")
+            battery = {"level": min(max(level, 0), 100), "charging": charging}
+            if battery != conn.battery:
+                conn.battery = battery
+                self.daemon.state.changed()
+            return None
+        if t == "status.host":
+            return await self.host_status()
+        if t == "status.ping":
+            message = b.get("message")
+            message = message[:1000] if isinstance(message, str) else ""
+            ns = tool("notify-send")
+            if not ns:
+                return {"ok": False}
+            name = conn.device["name"] if conn.device else "your phone"
+            rc, _, _ = await run_tool([ns, f"--app-name={APP_NAME}", "--", f"Ping from {name}", markup_escape(message)],
+                                      timeout=5)
+            return {"ok": rc == 0}
+        return await super().handle(conn, msg, data)
+
+    async def ring(self, conn):
+        """Ask the phone to ring; returns its `ok`."""
+        if "ring" not in conn.phone_caps("status"):
+            raise LinkError(ERR_PLUGIN_UNAVAILABLE, f"{conn.device['name']} cannot ring: its app does not offer it.")
+        reply = await conn.request("status.ring", {}, timeout=RING_TIMEOUT)
+        return reply["body"].get("ok") is True
+
+
+class ThemePlugin(Plugin):
+    """§8.8. The desktop's palette for the phone, resolved the way the shell's Config.qml/Theme.qml do: base palette
+    ← `theme` of theme.json (following ionixtheme's symlink) ← that theme's option overlays ← settings.json ←
+    config.json. Polls the files' resolved paths and mtimes, and the wallpaper `awww query` names, every THEME_POLL
+    s while a phone is connected; pushes theme.changed when the revision or the wallpaper hash moves."""
+
+    name = "theme"
+
+    BASE = {
+        "bgDeep": "#0f0a18", "bgWindow": "#1a1025", "bgCard": "#2d2d3f", "hover": "#3a2d50", "border": "#4a3d60",
+        "muted": "#6b5f80", "text": "#c4b5fd", "textBright": "#e2d9f3", "accent": "#9b59b6", "accentBright": "#a855f7",
+        "accentLight": "#c084fc", "green": "#2ecc71", "orange": "#f39c12", "red": "#e74c3c", "cyan": "#48dbfb",
+        "link": "#7c3aed",
+    }
+    RADIUS = {"sm": ("rSm", 8), "pill": ("rPill", 12), "panel": ("rPanel", 18)}
+    COLOR = re.compile(r"#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})")
+    # Example: ": DP-1: 1920x1080, scale: 1, currently displaying: image: /home/ion/.config/ionix/.wallpapers_active/97467.jpeg"
+    AWWW_IMAGE = re.compile(r"currently displaying: image: (.+)$")
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.current = None        # the Theme object last resolved
+        self.wallpaper = None      # path of the current wallpaper
+        self._signature = None
+        self._hash_cache = (None, None)
+        self._lock = asyncio.Lock()
+
+    def scaler(self):
+        """("magick" | "ffmpeg", path), or None."""
+        for name in ("magick", "ffmpeg"):
+            path = tool(name)
+            if path:
+                return name, path
+        return None
+
+    def caps(self):
+        return ["wallpaper"] if self.wallpaper and self.scaler() else []
+
+    async def prepare(self):
+        # The cap depends on whether a wallpaper is known right now.
+        await self.refresh(push=False)
+
+    async def start(self):
+        self.spawn(self._poll())
+
+    async def stop(self):
+        self._signature = None
+
+    async def _poll(self):
+        while True:
+            await asyncio.sleep(THEME_POLL)
+            await self.refresh(push=True)
+
+    async def on_ready(self, conn):
+        theme = self.current or await self.refresh(push=False)
+        await conn.send("theme.changed", theme)
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        if t == "theme.get":
+            return await self.refresh(push=True)
+        if t == "theme.wallpaper":
+            if "wallpaper" not in conn.plugins["theme"]["caps"]:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, "The desktop cannot send its wallpaper (needs awww and magick or ffmpeg).")
+            max_size = msg["body"].get("maxSize")
+            if not is_int(max_size) or not 256 <= max_size <= 2048:
+                raise LinkError(ERR_INVALID_ARGUMENT, "\"maxSize\" must be an integer from 256 to 2048.")
+            theme = await self.refresh(push=True)
+            path, scaler = self.wallpaper, self.scaler()
+            if not path:
+                raise LinkError(ERR_NOT_FOUND, "No wallpaper is showing (awww query names none).")
+            if scaler is None:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, "Neither magick nor ffmpeg is installed to scale the wallpaper.")
+            if scaler[0] == "magick":
+                argv = [scaler[1], f"{path}[0]", "-auto-orient", "-resize", f"{max_size}x{max_size}>", "-strip",
+                        "-quality", "80", "jpeg:-"]
+            else:
+                argv = [scaler[1], "-v", "error", "-nostdin", "-i", path, "-frames:v", "1", "-vf",
+                        f"scale=w='min(iw,{max_size})':h='min(ih,{max_size})':force_original_aspect_ratio=decrease",
+                        "-q:v", "4", "-f", "image2pipe", "-c:v", "mjpeg", "-"]
+            rc, jpeg, err = await run_tool(argv, timeout=30)
+            if rc != 0 or not jpeg.startswith(b"\xff\xd8"):
+                lines = err.decode("utf-8", "replace").strip().splitlines()
+                raise LinkError(ERR_FAILED, f"{scaler[0]} could not scale {path}: {lines[-1] if lines else 'no output'}",
+                                details={"exitCode": rc})
+            w, h = jpeg_size(jpeg) or (0, 0)
+            return {"format": "jpeg", "w": w, "h": h, "wallpaper": theme.get("wallpaper", "")}, jpeg
+        return await super().handle(conn, msg, data)
+
+    async def wallpaper_path(self):
+        """The first image `awww query` shows, or None."""
+        awww = tool("awww")
+        if not awww:
+            return None
+        try:
+            rc, out, _ = await run_tool([awww, "query"], timeout=3)
+        except LinkError:
+            return None
+        if rc != 0:
+            return None
+        for line in out.decode("utf-8", "replace").splitlines():
+            m = self.AWWW_IMAGE.search(line.strip())
+            if m and os.path.isfile(m.group(1)):
+                return m.group(1)
+        return None
+
+    def _files(self):
+        p = self.daemon.paths
+        return [os.path.join(p.theme_dir, "theme.json"), os.path.join(p.theme_dir, "settings.json"),
+                os.path.join(p.theme_dir, "config.json"), p.theme_name_file]
+
+    @staticmethod
+    def _file_signature(path):
+        try:
+            real = os.path.realpath(path)
+            st = os.stat(real)
+            return (path, real, st.st_mtime_ns, st.st_size)
+        except OSError:
+            return (path, None)
+
+    async def refresh(self, push=True):
+        """Re-resolve when any file (or the wallpaper) changed; push theme.changed when the result did."""
+        async with self._lock:
+            wallpaper = await self.wallpaper_path()
+            signature = tuple(self._file_signature(f) for f in self._files())
+            signature += (self._file_signature(wallpaper) if wallpaper else None,)
+            if signature == self._signature and self.current is not None:
+                return self.current
+            self._signature = signature
+            self.wallpaper = wallpaper
+            theme = self.resolve()
+            if wallpaper:
+                digest = await self._wallpaper_hash(signature[-1])
+                if digest:
+                    theme["wallpaper"] = digest
+            previous = self.current
+            self.current = theme
+            changed = (previous is None or previous["revision"] != theme["revision"]
+                       or previous.get("wallpaper") != theme.get("wallpaper"))
+        if push and changed:
+            log(f"Theme is now {theme['name']} (revision {theme['revision'][:8]}).", debug=True)
+            await self.broadcast("theme.changed", theme)
+        return theme
+
+    async def _wallpaper_hash(self, signature):
+        key, digest = self._hash_cache
+        if key == signature:
+            return digest
+        try:
+            digest = await asyncio.to_thread(self._hash_file, signature[1])
+        except OSError:
+            digest = None
+        self._hash_cache = (signature, digest)
+        return digest
+
+    @staticmethod
+    def _hash_file(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def resolve(self):
+        """The Theme object (§8.8) from the files as they are now."""
+        theme_file, settings_file, config_file, name_file = self._files()
+        theme_data = read_json(theme_file, {})
+        settings = read_json(settings_file, {})
+        user = read_json(config_file, {})
+        try:
+            with open(name_file, encoding="utf-8") as f:
+                name = f.read().strip() or "ionix"
+        except (OSError, UnicodeDecodeError):
+            name = "ionix"
+
+        merged = {}
+        deep_merge(merged, theme_data.get("theme"))
+        # Theme options (Config.qml layer 3): each option's on/off patch, by its stored value
+        for opt in theme_data.get("options", []) if isinstance(theme_data.get("options"), list) else []:
+            if not isinstance(opt, dict) or not isinstance(opt.get("key"), str) or not opt["key"]:
+                continue
+            patch = opt.get("on") if self._option_value(opt, name, user, settings) else opt.get("off")
+            if isinstance(patch, dict):
+                deep_merge(merged, patch.get("theme"))
+        deep_merge(merged, settings.get("theme"))
+        deep_merge(merged, user.get("theme"))
+
+        colors = {key: self._color(merged.get(key), base) for key, base in self.BASE.items()}
+        radius = {}
+        for key, (source, default) in self.RADIUS.items():
+            v = merged.get(source)
+            radius[key] = int(round(v)) if is_number(v) and v >= 0 else default
+        core = {"name": name, "colors": colors, "flat": merged.get("flat") is True, "radius": radius}
+        revision = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return {**core, "revision": revision}
+
+    @staticmethod
+    def _option_value(opt, theme_name, user, settings):
+        """An option's value as Config.themeOption() decides it: config.json, else settings.json, else its default."""
+        for layer in (user, settings):
+            themes = layer.get("themes")
+            stored = themes.get(theme_name) if isinstance(themes, dict) else None
+            if isinstance(stored, dict) and opt["key"] in stored:
+                return stored[opt["key"]] is True
+        return opt.get("default") is True
+
+    def _color(self, value, fallback):
+        if not isinstance(value, str):
+            return fallback
+        m = self.COLOR.fullmatch(value.strip().lower())
+        if not m:
+            return fallback
+        hexes = m.group(1)
+        if len(hexes) == 3:
+            hexes = "".join(c * 2 for c in hexes)
+        elif len(hexes) == 8:
+            hexes = hexes[2:]      # Qt's #AARRGGBB
+        return "#" + hexes
+
+
+# The plugin registry: order is the order of `ready.plugins`. A new plugin is one class above and one entry here.
+PLUGINS = [NotificationsPlugin, MediaPlugin, CommandsPlugin, ClipboardPlugin, InputPlugin, ScreenPlugin, StatusPlugin,
+           ThemePlugin]
+
+
+# ── Discovery (§4.1) ───────────────────────────────────────────────────────
+
+
+class Discovery(asyncio.DatagramProtocol):
+    """UDP 0.0.0.0:<port>: answers `discover` with a unicast `announce`, rate-limited to DISCOVERY_RATE/s,
+    honouring `want`. Ignores anything else silently."""
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self.transport = None
+        self._sent = []            # monotonic times of the announces in the last second
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        d = self.daemon
+        if not d.config.get("discovery", True) or len(data) > MAX_DATAGRAM:
+            return
+        try:
+            q = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return
+        if not isinstance(q, dict) or q.get("ionixlink") != 1 or q.get("type") != "discover":
+            return
+        want = q.get("want")
+        if want is not None and (not isinstance(want, str) or want.lower() != d.identity.host_id):
+            return
+        now = time.monotonic()
+        self._sent = [t for t in self._sent if now - t < 1]
+        if len(self._sent) >= DISCOVERY_RATE:
+            return
+        self._sent.append(now)
+        announce = {"ionixlink": 1, "type": "announce", "hostId": d.identity.host_id, "hostName": d.host_name(),
+                    "port": d.paths.port, "fingerprint": d.identity.fingerprint, "protocol": PROTOCOL,
+                    "protocolMin": PROTOCOL_MIN}
+        try:
+            self.transport.sendto(json.dumps(announce, separators=(",", ":")).encode("utf-8"), addr)
+        except OSError as e:
+            log(f"Discovery: could not answer {addr[0]}: {e}", debug=True)
+
+    def error_received(self, exc):
+        log(f"Discovery: {exc}", debug=True)
+
+
+# ── Control socket (§9) ────────────────────────────────────────────────────
+
+
+class ControlServer:
+    """$XDG_RUNTIME_DIR/ionix-link.sock, 0600, line JSON. Checks SO_PEERCRED uid == ours."""
+
+    LINE_LIMIT = 4 * 1024 * 1024   # a request line; clipboard text is up to 512 KiB before JSON escaping
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self.subscribers = set()   # writers of `subscribe` clients
+        self.server = None
+        self._queues = {}          # subscriber writer → asyncio.Queue of states
+        self._inode = None
+
+    async def start(self):
+        path = self.daemon.paths.socket
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        if os.path.exists(path):
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(path)
+            except OSError:
+                os.unlink(path)    # left behind by a daemon that died
+            else:
+                raise LinkError(ERR_FAILED, f"Another ionix-link daemon is already running (it owns {path}).")
+            finally:
+                probe.close()
+        old_umask = os.umask(0o177)
+        try:
+            self.server = await asyncio.start_unix_server(self.client, path=path, limit=self.LINE_LIMIT)
+        except OSError as e:
+            raise LinkError(ERR_FAILED, f"Cannot create the control socket {path}: {e.strerror or e}. "
+                            "Set IONIX_LINK_SOCKET to a shorter path (at most 107 bytes).")
+        finally:
+            os.umask(old_umask)
+        os.chmod(path, 0o600)
+        self._inode = os.stat(path).st_ino
+
+    async def stop(self):
+        """Close and unlink the socket."""
+        if self.server is None:
+            return
+        self.server.close()
+        for writer in list(self.subscribers):
+            writer.close()
+        path = self.daemon.paths.socket
+        try:
+            if os.stat(path).st_ino == self._inode:
+                os.unlink(path)
+        except OSError:
+            pass
+        self.server = None
+
+    async def _write(self, writer, obj):
+        writer.write((json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8"))
+        await writer.drain()
+
+    async def client(self, reader, writer):
+        """Serve one client: requests in order; `pair` with wait and `subscribe` switch it to event lines."""
+        sock = writer.get_extra_info("socket")
+        try:
+            _, uid, _ = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        except (OSError, AttributeError):
+            uid = -1
+        if uid != os.getuid():
+            log(f"Control socket: refused a client of uid {uid}.")
+            writer.close()
+            return
+        try:
+            while True:
+                try:
+                    line = await reader.readline()
+                except ValueError:
+                    await self._write(writer, {"ok": False, "code": CERR_BAD_REQUEST, "error": "The request line is too long."})
+                    break
+                if not line:
+                    break
+                follow = None
+                try:
+                    req = json.loads(line.decode("utf-8"))
+                    if not isinstance(req, dict) or not isinstance(req.get("cmd"), str):
+                        raise LinkError(CERR_BAD_REQUEST, "A request is {\"cmd\": str, \"args\": obj?}.")
+                    args = req.get("args") or {}
+                    if not isinstance(args, dict):
+                        raise LinkError(CERR_BAD_REQUEST, "\"args\" must be an object.")
+                    result, follow = await self.dispatch(req["cmd"], args, writer)
+                    response = {"ok": True, "result": result}
+                except (UnicodeDecodeError, ValueError):
+                    response = {"ok": False, "code": CERR_BAD_REQUEST, "error": "A request must be one line of JSON."}
+                except LinkError as e:
+                    response = {"ok": False, "code": e.code, "error": e.message}
+                except Exception:
+                    log(f"Control socket: bug:\n{traceback.format_exc()}")
+                    response = {"ok": False, "code": ERR_FAILED, "error": "The daemon hit a bug; see its log."}
+                await self._write(writer, response)
+                if follow is not None:
+                    await follow(reader, writer)
+                    break
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            self.subscribers.discard(writer)
+            self._queues.pop(writer, None)
+            self.daemon.pairing.control_closed(writer)
+            writer.close()
+
+    async def dispatch(self, cmd, args, writer):
+        """One request → (result dict, follow-up coroutine or None), or raise LinkError with a §9 code. Commands:
+        version, status, devices, pair, pair.respond, unpair, ring, clipboard, commands, reload, subscribe."""
+        d = self.daemon
+        if cmd == "version":
+            return {"version": VERSION, "protocol": PROTOCOL}, None
+        if cmd == "status":
+            return d.state.snapshot(), None
+        if cmd == "devices":
+            return {"devices": [d.device_entry(r) for r in d.devices.devices.values()]}, None
+        if cmd == "pair":
+            # The window this opens ends with this control connection (§4.2/§4.3): `ionix-link pair` holds it open.
+            result = await d.pairing.begin_qr(owner=writer)
+            if args.get("wait") is not True:
+                return result, None
+            event = d.pairing.wait_token()
+
+            async def follow(reader, writer):
+                closed = asyncio.create_task(reader.read())
+                done, _ = await asyncio.wait([event, closed], return_when=asyncio.FIRST_COMPLETED)
+                closed.cancel()
+                if event in done:
+                    await self._write(writer, event.result())
+
+            return result, follow
+        if cmd == "pair.respond":
+            if not isinstance(args.get("accept"), bool):
+                raise LinkError(CERR_BAD_REQUEST, "pair.respond needs \"accept\": true or false.")
+            code = args.get("code")
+            if code is not None and not isinstance(code, str):
+                raise LinkError(CERR_BAD_REQUEST, "pair.respond's \"code\" must be a string.")
+            return {"device": d.pairing.respond(args["accept"], code)}, None
+        if cmd == "unpair":
+            record = d.devices.resolve(args.get("device"))
+            return {"device": await d.unpair(record["id"])}, None
+        if cmd == "ring":
+            conn = self._connection(args.get("device"))
+            status = d.plugins["status"]
+            if "status" not in conn.plugins:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, f"{conn.device['name']} did not offer the status plugin.")
+            return {"ok": await status.ring(conn)}, None
+        if cmd == "clipboard":
+            text = args.get("text")
+            if not isinstance(text, str):
+                raise LinkError(CERR_BAD_REQUEST, "clipboard needs \"text\".")
+            conn = self._connection(args.get("device"))
+            if "clipboard" not in conn.plugins:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, f"{conn.device['name']} did not offer the clipboard plugin.")
+            await d.plugins["clipboard"].push_to(conn, text)
+            return {"device": conn.device["id"]}, None
+        if cmd == "commands":
+            plugin = d.plugins["commands"]
+            await plugin.check_reload()
+            out = []
+            for c in plugin.commands.values():
+                entry = plugin.public(c)
+                entry["source"] = c["source"]
+                entry["exec"] = ["sh", "-c", c["exec"]] if isinstance(c["exec"], str) else list(c["exec"])
+                out.append(entry)
+            return {"commands": out}, None
+        if cmd == "reload":
+            d.reload()
+            return {}, None
+        if cmd == "subscribe":
+            queue = asyncio.Queue()
+            self.subscribers.add(writer)
+            self._queues[writer] = queue
+
+            async def follow(reader, writer):
+                closed = asyncio.create_task(reader.read())
+                try:
+                    while True:
+                        getter = asyncio.create_task(queue.get())
+                        done, _ = await asyncio.wait([getter, closed], return_when=asyncio.FIRST_COMPLETED)
+                        if closed in done:
+                            getter.cancel()
+                            return
+                        await self._write(writer, {"event": "state", "state": getter.result()})
+                finally:
+                    closed.cancel()
+
+            return {}, follow
+        raise LinkError(CERR_UNKNOWN_CMD, f"Unknown control command \"{cmd}\".")
+
+    def _connection(self, device):
+        """The connection a DEVICE argument names, or the only connected phone when it is absent."""
+        d = self.daemon
+        if device is None:
+            if not d.connections:
+                raise LinkError(CERR_NOT_CONNECTED, "No phone is connected.")
+            if len(d.connections) > 1:
+                raise LinkError(CERR_AMBIGUOUS_DEVICE, "Several phones are connected; name one.")
+            return next(iter(d.connections.values()))
+        record = d.devices.resolve(device)
+        conn = d.connections.get(record["id"])
+        if conn is None:
+            raise LinkError(CERR_NOT_CONNECTED, f"{record['name']} is not connected.")
+        return conn
+
+    def publish(self, state):
+        """Send {"event": "state", "state": ...} to every subscriber; drop dead ones."""
+        for writer in list(self.subscribers):
+            if writer.is_closing():
+                self.subscribers.discard(writer)
+                self._queues.pop(writer, None)
+                continue
+            queue = self._queues.get(writer)
+            if queue is not None:
+                if queue.qsize() > 100:    # a client that stopped reading
+                    self.subscribers.discard(writer)
+                    writer.close()
+                    continue
+                queue.put_nowait(state)
+
+
+# ── State file (§10) ───────────────────────────────────────────────────────
+
+
+class StateFile:
+    """state.json for the desktop shell. write() coalesces bursts (at most every 250 ms) and publishes the same
+    object to control-socket subscribers."""
+
+    INTERVAL = 0.25
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self._handle = None
+        self._last_write = 0.0
+
+    def snapshot(self):
+        """The state.json object."""
+        d = self.daemon
+        return {
+            "version": 1, "running": True, "pid": os.getpid(), "updated": now_ms(),
+            "hostId": d.identity.host_id, "hostName": d.host_name(), "port": d.paths.port,
+            "fingerprint": d.identity.fingerprint,
+            "plugins": [p.name for p in d.available_plugins()],
+            "pairing": d.pairing.state(),
+            "devices": [d.device_entry(r) for r in d.devices.devices.values()],
+        }
+
+    def changed(self):
+        """Schedule a write."""
+        if self._handle is not None:
+            return
+        delay = max(0.0, self._last_write + self.INTERVAL - time.monotonic())
+        self._handle = asyncio.get_running_loop().call_later(delay, self._write)
+
+    def _write(self):
+        self._handle = None
+        self._last_write = time.monotonic()
+        snap = self.snapshot()
+        try:
+            write_json_atomic(self.daemon.paths.state_file, snap, 0o644)
+        except OSError as e:
+            log(f"Could not write {self.daemon.paths.state_file}: {e}")
+        if self.daemon.control is not None:
+            self.daemon.control.publish(snap)
+
+    def write_final(self):
+        """Synchronous write with running: false and every device disconnected, at exit."""
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        d = self.daemon
+        snap = self.snapshot()
+        snap["running"] = False
+        snap["pairing"] = None
+        for dev in snap["devices"]:
+            dev["connected"] = False
+            dev["plugins"] = []
+            dev.pop("address", None)
+            dev.pop("battery", None)
+        try:
+            write_json_atomic(d.paths.state_file, snap, 0o644)
+        except OSError as e:
+            log(f"Could not write {d.paths.state_file}: {e}")
+
+
+# ── Daemon ─────────────────────────────────────────────────────────────────
+
+
+class Daemon:
+    """Owns everything: paths, config, identity, devices, plugins, connections, pairing, discovery, control."""
+
+    def __init__(self):
+        self.paths = Paths()
+        self.config = None
+        self.identity = None
+        self.devices = None
+        self.plugins = {}          # name → Plugin instance (all of PLUGINS, available or not)
+        self.connections = {}      # device id → ready Connection
+        self.unready = {}          # connections before ready, oldest first (a dict as an ordered set)
+        self.pairing = None
+        self.control = None
+        self.state = None
+        self.auth_failures = {}    # source address → [monotonic times]
+        self.auth_locks = {}       # source address → monotonic time the lock-out ends
+        self.tasks = set()
+        self.handshakes = 0        # TLS handshakes in progress
+
+    def host_name(self):
+        """config name / IONIX_LINK_NAME, else socket.gethostname()."""
+        name = (self.config or {}).get("name", "")
+        return name.strip() if isinstance(name, str) and name.strip() else socket.gethostname()
+
+    def available_plugins(self):
+        """Plugins whose available() is true, in PLUGINS order."""
+        return [p for p in self.plugins.values() if p.available()]
+
+    def device_entry(self, record):
+        """A `Device` (§10): the stored record without its key, plus live connection state."""
+        entry = {"id": record["id"], "name": record["name"], "model": record["model"], "paired": record["paired"]}
+        if "lastSeen" in record:
+            entry["lastSeen"] = record["lastSeen"]
+        conn = self.connections.get(record["id"])
+        entry["connected"] = conn is not None
+        if conn is not None:
+            entry["address"] = conn.address
+            if conn.battery is not None:
+                entry["battery"] = conn.battery
+        entry["plugins"] = list(conn.plugins) if conn is not None else []
+        return entry
+
+    def auth_locked(self, address):
+        """Whether sign-ins from `address` are locked out (§5: per source address, a device id is no secret)."""
+        until = self.auth_locks.get(address)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            del self.auth_locks[address]
+            return False
+        return True
+
+    def auth_failed(self, address):
+        now = time.monotonic()
+        if len(self.auth_failures) > 1024:
+            self.auth_failures = {a: t for a, t in self.auth_failures.items() if now - t[-1] < AUTH_FAIL_WINDOW}
+        times = [t for t in self.auth_failures.get(address, []) if now - t < AUTH_FAIL_WINDOW] + [now]
+        self.auth_failures[address] = times
+        if len(times) >= AUTH_FAIL_LIMIT:
+            self.auth_locks[address] = now + AUTH_FAIL_WINDOW
+            self.auth_failures.pop(address, None)
+            log(f"{address} locked out for {AUTH_FAIL_WINDOW} s after {AUTH_FAIL_LIMIT} failed sign-ins.")
+
+    def spawn(self, coro):
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    def _listen_socket(self):
+        """The TCP listening socket: dual-stack `::` (IPV6_V6ONLY off, which asyncio would turn on), else 0.0.0.0."""
+        port = self.paths.port
+        if self.paths.bind:
+            infos = socket.getaddrinfo(self.paths.bind, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+            candidates = [(info[0], info[4]) for info in infos]
+        else:
+            candidates = [(socket.AF_INET6, ("::", port)), (socket.AF_INET, ("0.0.0.0", port))]
+        last = None
+        for family, addr in candidates:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                sock.bind(addr)
+                sock.listen(64)
+                sock.setblocking(False)
+                return sock
+            except OSError as e:
+                sock.close()
+                last = e
+        raise LinkError(ERR_FAILED, f"Cannot listen on TCP port {port}: {last.strerror if last else 'no address'}. "
+                        "Is another ionix-link running? Set IONIX_LINK_PORT to use another port.")
+
+    async def run(self):
+        """Load everything, start TLS server (dual-stack, MAX_PENDING_CONNECTIONS), UDP, control socket; SIGTERM /
+        SIGINT → send `error shutdown` to every phone, write the final state, exit 0."""
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(self._loop_exception)
+        self.config = load_config(self.paths)
+        self.identity = Identity(self.paths)
+        self.identity.load_or_create()
+        self.devices = DeviceStore(self.paths)
+        self.devices.load()
+        self.plugins = {cls.name: cls(self) for cls in PLUGINS}
+        self.plugins["commands"].load()
+        self.pairing = Pairing(self)
+        self.state = StateFile(self)
+        self.control = ControlServer(self)
+        await self.control.start()
+
+        server = udp = None
+        stop = asyncio.Event()
+        try:
+            server = self._listen_socket()
+            self.spawn(self._accept_loop(server, self.identity.ssl_context()))
+            udp_host = "0.0.0.0"
+            if self.paths.bind:
+                try:
+                    if ipaddress.ip_address(self.paths.bind).version == 4:
+                        udp_host = self.paths.bind
+                except ValueError:
+                    pass
+            try:
+                udp, _ = await loop.create_datagram_endpoint(lambda: Discovery(self), local_addr=(udp_host, self.paths.port),
+                                                             allow_broadcast=True)
+            except OSError as e:
+                log(f"UDP discovery is off: cannot bind port {self.paths.port} ({e.strerror}).")
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, stop.set)
+            loop.add_signal_handler(signal.SIGHUP, self.reload)
+            self.state.changed()
+            names = ", ".join(p.name for p in self.available_plugins())
+            log(f"ionix-link {VERSION} on port {self.paths.port} as \"{self.host_name()}\", "
+                f"fingerprint {self.identity.fingerprint[:16]}…, plugins: {names}.")
+            await stop.wait()
+            log("Stopping.")
+        finally:
+            await self._shutdown(server, udp)
+
+    async def _shutdown(self, server, udp):
+        if server is not None:
+            loop = asyncio.get_running_loop()
+            loop.remove_reader(server.fileno())
+            server.close()
+        if udp is not None:
+            udp.close()
+        conns = list(self.connections.values()) + list(self.unready)
+        if conns:
+            sends = [c.send_error(LinkError(ERR_SHUTDOWN, "The desktop's Ionix Link is stopping.")) for c in conns]
+            try:
+                await asyncio.wait_for(asyncio.gather(*sends, return_exceptions=True), 3)
+            except TimeoutError:
+                for c in conns:
+                    c.writer.transport.abort()
+        if self.pairing is not None:
+            await self.pairing.shutdown()
+        for plugin in self.plugins.values():
+            await plugin.shutdown()
+        input_plugin = self.plugins.get("input")
+        if input_plugin is not None:
+            input_plugin.pointer.close()
+        for task in list(self.tasks):
+            task.cancel()
+        if self.control is not None:
+            await self.control.stop()
+        if self.state is not None:
+            self.state.write_final()
+
+    def _loop_exception(self, loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, (ssl.SSLError, ConnectionError, TimeoutError)):
+            log(f"{context.get('message')}: {exc}", debug=True)   # port scanners, aborted handshakes
+            return
+        loop.default_exception_handler(context)
+
+    async def _accept_loop(self, listener, ctx):
+        """Accept TCP connections ourselves rather than through start_server, which gives no hook before the TLS
+        handshake: that is where MAX_HANDSHAKES is counted."""
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                sock, _ = await loop.sock_accept(listener)
+            except OSError as e:
+                log(f"accept failed: {e}", debug=True)    # EMFILE and the like: back off a little
+                await asyncio.sleep(0.1)
+                continue
+            if self.handshakes >= MAX_HANDSHAKES:
+                log(f"{MAX_HANDSHAKES} TLS handshakes already in progress; refused one.", debug=True)
+                sock.close()
+                continue
+            self.handshakes += 1
+            self.spawn(self._handshake(sock, ctx))
+
+    async def _handshake(self, sock, ctx):
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader(limit=2 ** 16)
+        protocol = asyncio.StreamReaderProtocol(reader)
+        try:
+            # ssl_shutdown_timeout: a TLS close otherwise waits up to 30 s for the peer's close_notify before the TCP
+            # close, and Dart's SecureSocket only notices the TCP close, so a closed connection looked alive that long.
+            transport, _ = await loop.connect_accepted_socket(lambda: protocol, sock, ssl=ctx,
+                                                              ssl_handshake_timeout=TLS_HANDSHAKE_TIMEOUT,
+                                                              ssl_shutdown_timeout=1)
+        except (OSError, ssl.SSLError, TimeoutError, ConnectionError) as e:
+            log(f"TLS handshake failed: {type(e).__name__}: {e}", debug=True)
+            sock.close()
+            return
+        finally:
+            self.handshakes -= 1
+        await self.on_tls_client(reader, asyncio.StreamWriter(transport, protocol, reader, loop))
+
+    def _evict(self, conn, why):
+        self.unready.pop(conn, None)
+        log(f"{conn.address}: closed an unready connection ({why}).", debug=True)
+        self.spawn(conn.close(why))
+
+    async def on_tls_client(self, reader, writer):
+        conn = Connection(self, reader, writer)
+        # §2: over a limit, the oldest unready connection makes room, so holding sockets open cannot lock a phone out.
+        same = [c for c in self.unready if c.address == conn.address]
+        if len(same) >= MAX_UNREADY_PER_ADDRESS:
+            self._evict(same[0], f"over {MAX_UNREADY_PER_ADDRESS} unready from one address")
+        if len(self.unready) >= MAX_PENDING_CONNECTIONS:
+            self._evict(next(iter(self.unready)), f"over {MAX_PENDING_CONNECTIONS} unready")
+        self.unready[conn] = None
+        await conn.run()
+
+    def reload(self):
+        """Re-read config.json and commands.json; push commands.changed."""
+        self.config = load_config(self.paths)
+        commands = self.plugins["commands"]
+        commands.load()
+        self.spawn(commands.broadcast("commands.changed", {}))
+        self.state.changed()
+        log("Reloaded config.json and commands.json.")
+
+    async def unpair(self, device_id, notify=True):
+        """Send pair.unpair if connected, close, remove from devices.json."""
+        record = self.devices.get(device_id)
+        if record is None:
+            raise LinkError(CERR_NO_DEVICE, "That phone is not paired.")
+        entry = self.device_entry(record)
+        self.devices.remove(device_id)
+        conn = self.connections.get(device_id)
+        if conn is not None:
+            if notify:
+                await conn.send(T_PAIR_UNPAIR, {})
+            await conn.close("unpaired")
+        log(f"Unpaired {record['name']}.")
+        self.state.changed()
+        entry["connected"] = False
+        return entry
+
+
+# ── CLI (client of the control socket) ─────────────────────────────────────
+
+HELP = """Ionix Link — use your phone with this desktop.
+
+Usage: ionix-link <command> [arguments] [flags]
+
+Commands:
+  status                          Show the daemon, this host and paired phones (default)
+  devices                         List paired phones (alias: list, ls)
+  pair                            Show a QR code to pair a phone (valid for 2 minutes)
+  pair accept|reject [-y]         Answer a phone that asked to pair with a code
+  unpair <DEVICE> [-y]            Forget a paired phone
+  ring <DEVICE>                   Make a phone ring
+  send-clipboard [DEVICE] [TEXT]  Send TEXT, or this desktop's clipboard, to a phone
+  commands                        List the commands phones can run
+  daemon                          Run the daemon (systemd does this: ionix-link.service)
+  help [command]                  Show this, or one command's usage
+  version                         Show the version
+
+Flags:
+  -j, --json                      Machine-readable output (status, devices, commands)
+  -y, --yes                       Do not ask (unpair, pair accept)
+      --trace                     Print stack traces on errors
+
+DEVICE is an id, a unique id prefix (4+ characters) or a phone name.
+
+Run "ionix-link help <command>" for more information on a command."""
+
+# Per-command usage, printed by `help <command>` and on missing arguments: (description, usage, options).
+USAGE = {
+    "status": ("Show the daemon, this host and paired phones.", "ionix-link status [-j]", ["-j, --json   Print state.json"]),
+    "devices": ("List paired phones.", "ionix-link devices [-j]", ["-j, --json   JSON output"]),
+    "pair": ("Pair a phone: show a QR code and open pairing by code until it is scanned, 2 minutes pass or you press "
+             "Ctrl-C. `accept`/`reject` answer a phone asking with a code.", "ionix-link pair [accept|reject] [-y]",
+             ["-y, --yes    Accept without asking"]),
+    "unpair": ("Forget a paired phone. It must pair again to connect.", "ionix-link unpair <DEVICE> [-y]", ["-y, --yes    Do not ask first"]),
+    "ring": ("Make a phone ring at full volume until it is found.", "ionix-link ring <DEVICE>", []),
+    "send-clipboard": ("Send text to a phone's clipboard.", "ionix-link send-clipboard [DEVICE] [TEXT]", []),
+    "commands": ("List the commands phones can run (built-ins and commands.json).", "ionix-link commands [-j]", ["-j, --json   JSON output"]),
+    "daemon": ("Run the daemon in the foreground.", "ionix-link daemon", []),
+}
+USAGE["list"] = USAGE["ls"] = USAGE["devices"]
+
+
+def parse_flags(args, allowed):
+    """Split `args` into (positionals, flags). Long and short forms, combined short flags (-jy); an unknown flag
+    raises UsageError. `allowed` maps long name → short letter, e.g. {"json": "j", "yes": "y"}."""
+    short = {v: k for k, v in allowed.items() if v}
+    positionals, flags = [], {}
+    rest = False
+    for a in args:
+        if rest or a == "-" or not a.startswith("-"):
+            positionals.append(a)
+        elif a == "--":
+            rest = True
+        elif a.startswith("--"):
+            name = a[2:]
+            if name not in allowed:
+                raise UsageError(f"Unknown flag: {a}")
+            flags[name] = True
+        else:
+            for ch in a[1:]:
+                if ch not in short:
+                    raise UsageError(f"Unknown flag: -{ch}")
+                flags[short[ch]] = True
+    return positionals, flags
+
+
+def control_request(cmd, args=None, stream=False):
+    """Blocking client: send one request to the control socket; return the result, or with `stream` a tuple of the
+    result and a generator of the event lines after it. Unreachable socket → exit EXIT_NO_DAEMON with
+    "The Ionix Link daemon is not running. Start it with `systemctl --user start ionix-link`."."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(socket_path())
+    except OSError:
+        sock.close()
+        print("The Ionix Link daemon is not running. Start it with `systemctl --user start ionix-link`.", file=sys.stderr)
+        sys.exit(EXIT_NO_DAEMON)
+    sock.settimeout(None if stream else 30)
+    try:
+        request = {"cmd": cmd}
+        if args:
+            request["args"] = args
+        sock.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
+        reader = sock.makefile("rb")
+        line = reader.readline()
+    except TimeoutError:
+        sock.close()
+        raise LinkError(ERR_TIMEOUT, "The daemon did not answer within 30 s.")
+    except OSError as e:
+        sock.close()
+        raise LinkError(ERR_FAILED, f"Lost the daemon's control socket: {e}.")
+    if not line:
+        sock.close()
+        raise LinkError(ERR_FAILED, "The daemon closed the connection without answering.")
+    try:
+        response = json.loads(line)
+    except ValueError:
+        sock.close()
+        raise LinkError(ERR_FAILED, "The daemon answered with something that is not JSON.")
+    if not response.get("ok"):
+        sock.close()
+        raise LinkError(str(response.get("code", ERR_FAILED)), str(response.get("error", "The daemon reported an error.")))
+    result = response.get("result", {})
+    if not stream:
+        sock.close()
+        return result
+
+    def events():
+        try:
+            for raw in reader:
+                try:
+                    yield json.loads(raw)
+                except ValueError:
+                    continue
+        finally:
+            sock.close()
+
+    return result, events()
+
+
+def confirm(question):
+    """`question [y/N]: ` — True only for y/Y."""
+    try:
+        return input(f"{question} [y/N]: ").strip() in ("y", "Y")
+    except EOFError:
+        return False
+
+
+def _print_json(obj):
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def _ago(ms):
+    if not is_int(ms) or ms <= 0:
+        return "never"
+    s = max(0, (now_ms() - ms) // 1000)
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{s // 60} min ago"
+    if s < 86400:
+        return f"{s // 3600} h ago"
+    return f"{s // 86400} days ago"
+
+
+def _table(rows, indent="  "):
+    """Print rows of strings with aligned columns."""
+    if not rows:
+        return
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print(indent + "  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
+
+
+def _device_rows(devices):
+    rows = [["NAME", "ID", "MODEL", "STATUS", "BATTERY", "LAST SEEN"]]
+    for d in devices:
+        status = f"connected ({d.get('address')})" if d.get("connected") else "offline"
+        b = d.get("battery")
+        battery = f"{b['level']}%{' charging' if b.get('charging') else ''}" if isinstance(b, dict) else ""
+        rows.append([d.get("name", ""), d.get("id", "")[:8], d.get("model", ""), status, battery,
+                     "now" if d.get("connected") else _ago(d.get("lastSeen"))])
+    return rows
+
+
+def cmd_status(args):
+    _, flags = parse_flags(args, {"json": "j"})
+    state = control_request("status")
+    if flags.get("json"):
+        _print_json(state)
+        return EXIT_OK
+    fp = state.get("fingerprint", "")
+    print(f"Ionix Link {VERSION}, daemon running (pid {state.get('pid')})")
+    _table([
+        ["Host:", f"{state.get('hostName')} (port {state.get('port')})"],
+        ["Host id:", state.get("hostId", "")],
+        ["Fingerprint:", " ".join(fp[i:i + 4] for i in range(0, len(fp), 4))],
+        ["Plugins:", ", ".join(state.get("plugins", [])) or "none"],
+    ], indent="")
+    pairing = state.get("pairing")
+    if isinstance(pairing, dict):
+        left = max(0, (pairing.get("expires", 0) - now_ms()) // 1000)
+        if pairing.get("mode") == "code":
+            print(f"\n{pairing.get('name')} asks to pair, showing {format_code(pairing.get('code', ''))}. "
+                  f"Answer with \"ionix-link pair accept\" or \"reject\" ({left} s left).")
+        else:
+            print(f"\nA pairing QR code is open ({left // 60}:{left % 60:02d} left).")
+    devices = state.get("devices", [])
+    if not devices:
+        print("\nNo paired phones. Run \"ionix-link pair\" to pair one.")
+        return EXIT_OK
+    print("\nPhones:")
+    _table(_device_rows(devices))
+    return EXIT_OK
+
+
+def cmd_devices(args):
+    _, flags = parse_flags(args, {"json": "j"})
+    devices = control_request("devices").get("devices", [])
+    if flags.get("json"):
+        _print_json(devices)
+        return EXIT_OK
+    if not devices:
+        print("No paired phones. Run \"ionix-link pair\" to pair one.")
+        return EXIT_OK
+    _table(_device_rows(devices), indent="")
+    return EXIT_OK
+
+
+def cmd_pair(args):
+    """QR: print `qrencode -t ANSIUTF8 -m 2 <uri>` (or the URI and an install hint without qrencode: pacman -S
+    qrencode / apt install qrencode), "Waiting for a phone... (expires in 2:00)", then "Done! Paired with <name>."
+    or "The pairing code expired." (exit 1). `accept`/`reject` → pair.respond."""
+    positionals, flags = parse_flags(args, {"yes": "y"})
+    if positionals:
+        answer = positionals[0]
+        if answer not in ("accept", "reject") or len(positionals) > 1:
+            raise UsageError(f"Unknown pair argument: {' '.join(positionals)}")
+        pending = control_request("status").get("pairing")
+        if not isinstance(pending, dict) or pending.get("mode") != "code":
+            raise LinkError(CERR_NO_PENDING, "No phone is waiting for a pairing answer.")
+        # Names come from the phone; the daemon already stripped control characters from them.
+        print(f"{pending.get('name')} ({pending.get('model') or 'unknown model'}) shows "
+              f"{format_code(pending.get('code', ''))}.")
+        if pending.get("replaces"):
+            print(f"This replaces the paired phone \"{pending['replaces']}\".")
+        if answer == "accept" and not flags.get("yes") and not confirm("Accept it? Only if your phone shows the same code."):
+            print("Not answered; the phone keeps waiting.")
+            return EXIT_FAILURE
+        device = control_request("pair.respond", {"accept": answer == "accept", "code": pending.get("code")}).get("device", {})
+        verb = "Accepted" if answer == "accept" else "Rejected"
+        print(f"{verb} {device.get('name')} ({format_code(device.get('code', ''))}).")
+        return EXIT_OK
+
+    result, events = control_request("pair", {"wait": True}, stream=True)
+    uri = result["uri"]
+    qrencode = tool("qrencode")
+    printed = False
+    if qrencode:
+        try:
+            qr = subprocess.run([qrencode, "-t", "ANSIUTF8", "-m", "2", "--", uri], capture_output=True, timeout=10)
+            if qr.returncode == 0:
+                sys.stdout.write(qr.stdout.decode("utf-8", "replace"))
+                printed = True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if not printed:
+        print("qrencode is not installed, so there is no QR code. Install it with `sudo pacman -S qrencode` (Arch) "
+              "or `sudo apt install qrencode` (Debian/Ubuntu), or enter this in the app:")
+    print(f"\n{uri}\n")
+    left = max(0, (result.get("expires", 0) - now_ms()) // 1000)
+    print("Scan it with Ionix Link on your phone. A phone without a camera can pair by code while this is open: "
+          "choose \"Pair with a code\" in the app, then answer here with \"ionix-link pair accept\" or the notification.")
+    print(f"Waiting for a phone... (expires in {left // 60}:{left % 60:02d}; Ctrl-C closes pairing)", flush=True)
+    for event in events:
+        kind = event.get("event")
+        if kind == "paired":
+            print(f"Done! Paired with {event.get('device', {}).get('name', 'the phone')}.")
+            return EXIT_OK
+        if kind == "expired":
+            print("The pairing code expired.", file=sys.stderr)
+            return EXIT_FAILURE
+        if kind == "replaced":
+            print("Another \"ionix-link pair\" started, so this code no longer works.", file=sys.stderr)
+            return EXIT_FAILURE
+    print("The daemon stopped before a phone paired.", file=sys.stderr)
+    return EXIT_FAILURE
+
+
+def cmd_unpair(args):
+    positionals, flags = parse_flags(args, {"yes": "y"})
+    if len(positionals) != 1:
+        raise UsageError("Name the phone to unpair." if not positionals else "Name one phone to unpair.")
+    query = positionals[0]
+    if not flags.get("yes") and not confirm(f"Unpair \"{query}\"? It must pair again to connect."):
+        print("Cancelled.")
+        return EXIT_FAILURE
+    device = control_request("unpair", {"device": query}).get("device", {})
+    print(f"Unpaired {device.get('name')}.")
+    return EXIT_OK
+
+
+def cmd_ring(args):
+    positionals, _ = parse_flags(args, {})
+    if len(positionals) != 1:
+        raise UsageError("Name the phone to ring.")
+    if control_request("ring", {"device": positionals[0]}).get("ok"):
+        print(f"{positionals[0]} is ringing.")
+        return EXIT_OK
+    print(f"{positionals[0]} could not ring.", file=sys.stderr)
+    return EXIT_FAILURE
+
+
+def cmd_send_clipboard(args):
+    """No TEXT: read the desktop clipboard with wl-paste; no DEVICE: the only connected phone."""
+    positionals, _ = parse_flags(args, {})
+    if len(positionals) > 2:
+        raise UsageError("Too many arguments; quote TEXT that has spaces.")
+    device = positionals[0] if positionals else None
+    if len(positionals) == 2:
+        text = positionals[1]
+    else:
+        wl_paste = tool("wl-paste")
+        if not wl_paste:
+            raise LinkError(ERR_FAILED, "wl-paste is needed to read the clipboard. Install it with `sudo pacman -S "
+                            "wl-clipboard` (Arch) or `sudo apt install wl-clipboard` (Debian/Ubuntu), or give TEXT.")
+        try:
+            out = subprocess.run([wl_paste, "--no-newline", "--type", "text"], capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise LinkError(ERR_FAILED, f"Could not read the clipboard: {e}.")
+        if out.returncode != 0 or not out.stdout:
+            raise LinkError(ERR_FAILED, "The clipboard is empty or holds no text.")
+        text = out.stdout.decode("utf-8", "replace")
+    args = {"text": text}
+    if device is not None:
+        args["device"] = device
+    sent = control_request("clipboard", args).get("device", "")
+    print(f"Sent {len(text)} characters to {device or sent[:8]}.")
+    return EXIT_OK
+
+
+def cmd_commands(args):
+    _, flags = parse_flags(args, {"json": "j"})
+    commands = control_request("commands").get("commands", [])
+    if flags.get("json"):
+        _print_json(commands)
+        return EXIT_OK
+    if not commands:
+        print("No commands. Add some to ~/.config/ionix/link/commands.json.")
+        return EXIT_OK
+    rows = [["ID", "TITLE", "GROUP", "SOURCE", "CONFIRM", "RUNS"]]
+    for c in commands:
+        rows.append([c["id"], c["title"], c.get("group", "Commands"), c["source"], "yes" if c["confirm"] else "no",
+                     " ".join(c["exec"])])
+    _table(rows, indent="")
+    return EXIT_OK
+
+
+def cmd_daemon(args):
+    parse_flags(args, {})
+    asyncio.run(Daemon().run())
+    return EXIT_OK
+
+
+def cmd_help(args):
+    if args and args[0] in USAGE:
+        desc, usage, options = USAGE[args[0]]
+        print(f"{desc}\n\nUsage: {usage}")
+        if options:
+            print("\nOptions:\n" + "\n".join(f"  {o}" for o in options))
+        return EXIT_OK
+    print(HELP)
+    return EXIT_OK
+
+
+def cmd_version(args):
+    print(f"ionix-link {VERSION} (protocol {PROTOCOL})")
+    return EXIT_OK
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "devices": cmd_devices,
+    "list": cmd_devices,
+    "ls": cmd_devices,
+    "pair": cmd_pair,
+    "unpair": cmd_unpair,
+    "ring": cmd_ring,
+    "send-clipboard": cmd_send_clipboard,
+    "commands": cmd_commands,
+    "daemon": cmd_daemon,
+    "help": cmd_help,
+    "-h": cmd_help,
+    "--help": cmd_help,
+    "version": cmd_version,
+    "--version": cmd_version,
+}
+
+
+def main(argv):
+    args = argv[1:]
+    trace = "--trace" in args
+    args = [a for a in args if a != "--trace"]
+    cmd = args[0] if args else "status"
+    handler = COMMANDS.get(cmd)
+    if handler is None:
+        print(f"Command not found: {cmd}\nRun \"ionix-link help\" for a list of commands.", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        return handler(args[1:])
+    except UsageError as e:
+        print(f"{e}\n", file=sys.stderr)
+        desc, usage, options = USAGE.get(cmd, ("", f"ionix-link {cmd}", []))
+        print(f"{desc}\n\nUsage: {usage}".lstrip(), file=sys.stderr)
+        if options:
+            print("\nOptions:\n" + "\n".join(f"  {o}" for o in options), file=sys.stderr)
+        return EXIT_USAGE
+    except LinkError as e:
+        if trace:
+            raise
+        print(e.message, file=sys.stderr)
+        return EXIT_NO_DEVICE if e.code in (CERR_NO_DEVICE, CERR_AMBIGUOUS_DEVICE, CERR_NOT_CONNECTED) else EXIT_FAILURE
+    except BrokenPipeError:
+        return EXIT_FAILURE
+    except Exception as e:
+        if trace:
+            raise
+        print(f"Unexpected error: {e}. Run again with --trace for details, and please report it.", file=sys.stderr)
+        return EXIT_FAILURE
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)

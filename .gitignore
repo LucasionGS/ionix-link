@@ -1,0 +1,8 @@
+/pkg/
+/src/
+.pkgver
+*.pkg.tar.*
+*.tar.gz
+*.log
+__pycache__/
+/packaging/aur/.aur-repo/

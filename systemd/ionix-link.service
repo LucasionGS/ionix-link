@@ -1,0 +1,16 @@
+[Unit]
+Description=Ionix Link phone companion daemon
+Documentation=https://github.com/LucasionGS/ionix-link
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ionix-link daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target
