@@ -35,6 +35,7 @@ optdepends=(
     'grim: screen view'
     'hyprland: list monitors for the screen view'
     'wlr-randr: list monitors on other wlroots compositors'
+    'imagemagick: cover art and the wallpaper on the phone (ffmpeg works too)'
 )
 provides=("$_pkgname")
 conflicts=("$_pkgname")
