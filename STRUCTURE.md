@@ -33,6 +33,7 @@ app/                           Flutter app (android + linux), package ionix_link
     android_platform.dart      The real one
     fallback_platform.dart     No-op for the Linux build
     platform_glue.dart         Subscribes Link streams to the platform (notifications, ring, battery, clipboard)
+  android/.../kotlin/…/ionix_link/  Native Android: MainActivity, PhoneNotifications (channels, prefs), LinkNotificationListener
   lib/ui/                      Layer 2: widgets only
     app.dart                   IonixLinkApp (MaterialApp, routes)
     theme.dart                 buildTheme(LinkTheme) + IonixTokens: the whole look (glass, pills, bar), built

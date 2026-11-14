@@ -57,6 +57,16 @@
             android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
             android:foregroundServiceType="connectedDevice"
             android:exported="false"/>
+        <!-- Forwards the phone's notifications to the desktop; Android binds it once the user grants notification access. -->
+        <service
+            android:name=".LinkNotificationListener"
+            android:label="Ionix Link"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService"/>
+            </intent-filter>
+        </service>
         <!-- The keep-alive notification's small icon, which flutter_foreground_task looks up by this name. -->
         <meta-data
             android:name="dev.ionnet.ionix_link.NOTIFICATION_ICON"

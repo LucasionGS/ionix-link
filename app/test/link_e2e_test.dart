@@ -48,6 +48,7 @@ void main() {
     info = jsonDecode(await File("$stateDir/info.json").readAsString()) as Map<String, dynamic>;
     storeDir = (await Directory.systemTemp.createTemp("ionix-link-e2e-")).path;
     LinkDiscovery.broadcastAddress = "127.0.0.1";
+    Link.notifications.offerForward = true;
     await Link.init(platformName: "Test phone", model: "Pixel Test", storeDirectory: storeDir, keyStore: keys);
   });
 
@@ -93,6 +94,46 @@ void main() {
     await waitFor(Link.commands.commands, (commands) => commands.isNotEmpty, what: "commands.list");
     expect(Link.commands.commands.value.single.group, "Tests");
     await waitFor(Link.notifications.active, (list) => list.isNotEmpty, what: "notifications.list");
+  }, skip: skip);
+
+  test("phone notifications: the forward cap, posted, updated, removed, and a dismiss from the desktop", () async {
+    final stats = await debug("debug.stats");
+    expect(stats["notificationCaps"], ["mirror", "forward"]);
+    expect(Link.notifications.canSendPhone, isTrue);
+    final dismissed = <String>[];
+    final subscription = Link.notifications.phoneDismissed.listen(dismissed.add);
+    const key = "0|com.chat|1|null|10042";
+    Link.notifications.sendPhonePosted(PhoneNotification(
+      key: key,
+      app: "com.chat",
+      appName: "Chat",
+      title: "T" * 2000,
+      text: "line one\nline two ${"é" * 5000}",
+      time: DateTime.fromMillisecondsSinceEpoch(1700000000000),
+    ));
+    Link.notifications.sendPhonePosted(PhoneNotification(key: key, app: "com.chat", appName: "Chat", title: "Alice", text: "Edited", time: DateTime.fromMillisecondsSinceEpoch(1700000001000), silent: true));
+    Link.notifications.sendPhoneRemoved(key);
+    late List<dynamic> phone;
+    for (var i = 0; i < 50; i++) {
+      phone = (await debug("debug.stats"))["phone"] as List<dynamic>;
+      if (phone.length >= 3) break;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    expect(phone.map((entry) => entry["type"]), ["notifications.phonePosted", "notifications.phonePosted", "notifications.phoneRemoved"]);
+    final first = phone[0]["body"] as Map<String, dynamic>;
+    expect(first["key"], key);
+    expect(first["app"], "com.chat");
+    expect(first["appName"], "Chat");
+    expect((first["title"] as String).length, 512);
+    expect((first["text"] as String).length, 4096);
+    expect(first["time"], 1700000000000);
+    expect(first.containsKey("silent"), isFalse);
+    expect(phone[1]["body"], {"key": key, "app": "com.chat", "appName": "Chat", "title": "Alice", "text": "Edited", "time": 1700000001000, "silent": true});
+    expect(phone[2]["body"], {"key": key});
+    await debug("debug.phoneDismiss", {"key": key});
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(dismissed, [key]);
+    await subscription.cancel();
   }, skip: skip);
 
   test("a used token is rejected", () async {

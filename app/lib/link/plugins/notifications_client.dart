@@ -9,7 +9,8 @@ import "../protocol/errors.dart";
 import "../protocol/json_read.dart";
 import "plugin_client.dart";
 
-/// `notifications.*`: desktop notifications mirrored to the phone (`PROTOCOL.md` 8.1).
+/// `notifications.*`: desktop notifications mirrored to the phone (`PROTOCOL.md` 8.1), and the phone's own shown on the
+/// desktop (8.10).
 class NotificationsClient extends PluginClient {
   // Message types
   static const String typePosted = "notifications.posted";
@@ -17,8 +18,18 @@ class NotificationsClient extends PluginClient {
   static const String typeList = "notifications.list";
   static const String typeDismiss = "notifications.dismiss";
 
+  static const String typePhonePosted = "notifications.phonePosted";
+  static const String typePhoneRemoved = "notifications.phoneRemoved";
+  static const String typePhoneDismiss = "notifications.phoneDismiss";
+
   /// Phone cap: it mirrors notifications.
   static const String capMirror = "mirror";
+
+  /// Phone cap: it can forward its own notifications to the desktop (see [offerForward]).
+  static const String capForward = "forward";
+
+  /// Daemon cap: it can show the phone's notifications.
+  static const String capPhone = "phone";
 
   /// Daemon cap: it can close notifications on request.
   static const String capDismiss = "dismiss";
@@ -26,12 +37,17 @@ class NotificationsClient extends PluginClient {
   @override
   String get name => LinkPlugins.notifications;
 
+  /// Whether to list [capForward] in `hello`. Set by `main` before [Link.init] when the platform can read the phone's
+  /// notifications (Android); whether the user has turned the feature on is the platform's business, not the link's.
+  bool offerForward = false;
+
   @override
-  List<String> get localCaps => const [capMirror];
+  List<String> get localCaps => [capMirror, if (offerForward) capForward];
 
   final ValueNotifier<List<DesktopNotification>> _active = ValueNotifier(const []);
   final StreamController<DesktopNotification> _posted = StreamController.broadcast();
   final StreamController<int> _closed = StreamController.broadcast();
+  final StreamController<String> _phoneDismissed = StreamController.broadcast();
 
   /// Notifications currently open on the desktop, newest first. Filled by `notifications.list` on attach and kept
   /// up to date by pushes. Cleared on detach.
@@ -42,6 +58,25 @@ class NotificationsClient extends PluginClient {
 
   /// Ids of notifications closed on the desktop.
   Stream<int> get closed => _closed.stream;
+
+  /// Keys of the phone's notifications the user closed on the desktop; the platform cancels them on the phone.
+  Stream<String> get phoneDismissed => _phoneDismissed.stream;
+
+  /// Whether the phone's notifications can be sent now: connected, and the desktop can show them.
+  bool get canSendPhone => isAvailable && hasCap(capPhone);
+
+  /// Show [notification] on the desktop (or update it, when its key is already open there). Does nothing unless
+  /// [canSendPhone].
+  void sendPhonePosted(PhoneNotification notification) {
+    if (!canSendPhone) return;
+    send(typePhonePosted, notification.toJson());
+  }
+
+  /// Tell the desktop the phone dismissed the notification with [key]. Does nothing unless [canSendPhone].
+  void sendPhoneRemoved(String key) {
+    if (!canSendPhone) return;
+    send(typePhoneRemoved, {"key": key});
+  }
 
   /// Re-fetch the list.
   Future<void> refresh() async {
@@ -70,6 +105,7 @@ class NotificationsClient extends PluginClient {
       _active.value = List.unmodifiable(_active.value.where((entry) => entry.id != id));
       _closed.add(id);
     });
+    listen(typePhoneDismiss, (message) => _phoneDismissed.add(JsonRead.string(message.body, "key")));
     runQuietly(refresh(), "list");
   }
 
@@ -152,5 +188,60 @@ class DesktopNotification {
       urgency: NotificationUrgency.fromWire(JsonRead.optString(json, "urgency")),
       time: time == null ? DateTime.now() : DateTime.fromMillisecondsSinceEpoch(time),
     );
+  }
+}
+
+/// A notification of this phone, as `notifications.phonePosted` carries it (`PROTOCOL.md` 8.10).
+class PhoneNotification {
+  PhoneNotification({
+    required this.key,
+    required this.app,
+    required this.appName,
+    required this.title,
+    required this.text,
+    required this.time,
+    this.silent = false,
+  });
+
+  /// Longest key, title and text the protocol takes: the phone cuts, so the desktop never has to refuse.
+  static const int keyMax = 1024;
+  static const int titleMax = 512;
+  static const int textMax = 4096;
+
+  /// Android's notification key; the same key again is an update.
+  final String key;
+
+  /// Package name of the app.
+  final String app;
+
+  /// The app's label.
+  final String appName;
+
+  final String title;
+  final String text;
+
+  /// When the phone posted it.
+  final DateTime time;
+
+  /// Low importance: the desktop shows it quietly.
+  final bool silent;
+
+  Map<String, dynamic> toJson() {
+    return {
+      "key": _cut(key, keyMax),
+      "app": _cut(app, 256),
+      "appName": _cut(appName, 128),
+      "title": _cut(title, titleMax),
+      "text": _cut(text, textMax),
+      "time": time.millisecondsSinceEpoch,
+      if (silent) "silent": true,
+    };
+  }
+
+  /// Cut to [max] UTF-16 units without leaving half a surrogate pair.
+  static String _cut(String value, int max) {
+    if (value.length <= max) return value;
+    final end = value.codeUnitAt(max - 1) >= 0xD800 && value.codeUnitAt(max - 1) <= 0xDBFF ? max - 1 : max;
+    return value.substring(0, end);
   }
 }

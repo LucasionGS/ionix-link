@@ -51,6 +51,36 @@ abstract class LinkPlatform {
   /// A one-off informational notification ("Ping from myeonix", "Clipboard from myeonix").
   Future<void> showMessage(String title, String body);
 
+  // Phone notifications on the desktop
+
+  /// Whether this platform can read the phone's own notifications and forward them (Android). The settings page hides
+  /// its section otherwise.
+  bool get canForwardNotifications;
+
+  /// Whether the user has granted notification access to this app in the system settings.
+  Future<bool> notificationAccessGranted();
+
+  /// Open the system's notification access settings.
+  Future<void> openNotificationAccessSettings();
+
+  /// Whether the user turned "Phone notifications on the desktop" on. Kept by the platform: the service that reads the
+  /// notifications is started by the system and has to know without Dart.
+  Future<bool> phoneNotificationsEnabled();
+
+  Future<void> setPhoneNotificationsEnabled(bool enabled);
+
+  /// Apps that have posted a notification since the feature was turned on, by name, each with whether it is forwarded.
+  Future<List<PhoneNotificationApp>> phoneNotificationApps();
+
+  /// Forward (or stop forwarding) the notifications of the app with package [package].
+  Future<void> setPhoneNotificationApp(String package, bool allowed);
+
+  /// Notifications posted and removed on this phone, already filtered (feature on, app allowed, nothing ongoing).
+  Stream<PhoneNotificationEvent> get phoneNotifications;
+
+  /// Cancel the phone notification [key] because the user closed it on the desktop. Some cannot be cancelled.
+  Future<void> cancelPhoneNotification(String key);
+
   // Battery
 
   /// Current battery, or null if unknown.
@@ -154,4 +184,25 @@ class PlatformDevice {
 
   /// Model, e.g. "Pixel 8".
   final String model;
+}
+
+/// An app in the phone-notification filter list.
+class PhoneNotificationApp {
+  const PhoneNotificationApp({required this.package, required this.name, required this.allowed});
+
+  final String package;
+  final String name;
+
+  /// Whether its notifications are forwarded (the default).
+  final bool allowed;
+}
+
+/// A phone notification appearing or going away: [posted] is set for the first, null for the second.
+class PhoneNotificationEvent {
+  const PhoneNotificationEvent({required this.key, this.posted});
+
+  /// The Android notification key.
+  final String key;
+
+  final PhoneNotification? posted;
 }

@@ -102,6 +102,10 @@ DISCOVERY_RATE = 10                # announces per second, in total
 NOTIFY_KEEP = 50                   # open notifications remembered for notifications.list
 NOTIFY_SUMMARY_MAX = 512           # characters of a mirrored notification's summary ...
 NOTIFY_BODY_MAX = 4096             # ... and body (§2: nothing over 1 MiB goes on the wire)
+PHONE_NOTIFY_KEEP = 100            # phone notifications remembered per phone (§8.10); older ones just stop being tracked
+PHONE_CLOSE_PARALLEL = 8           # busctl calls at once when a phone leaves and its notifications are closed
+PHONE_KEY_MAX = 1024               # characters of a phone notification's key
+PHONE_HINT = "x-ionix-link"        # hint on every notification the daemon posts for a phone, so the monitor skips it
 MEDIA_DEBOUNCE = 0.15              # s
 COMMAND_TIMEOUT = 10               # s a command may run before the reply says detached
 COMMAND_TIMEOUT_MAX = 25           # s, so the reply still beats the phone's 30 s commands.run timeout
@@ -173,7 +177,8 @@ PRE_READY_TYPES = {T_HELLO, T_AUTH, T_PAIR_REQUEST, T_PAIR_CONFIRM, T_PING}
 CORE_TYPES = {T_HELLO, T_CHALLENGE, T_AUTH, T_READY, T_ERROR, T_PING, T_PONG, T_PAIR_REQUEST, T_PAIR_CHALLENGE,
               T_PAIR_CONFIRM, T_PAIR_PENDING, T_PAIR_ACCEPT, T_PAIR_REJECT, T_PAIR_UNPAIR}
 # The phone's plugin messages that are pushes (§8); any other plugin type without an `id` is ignored (§2).
-PUSH_TYPES = {"input.move", "input.moveAbsolute", "input.button", "input.scroll", "screen.ack", "status.battery"}
+PUSH_TYPES = {"input.move", "input.moveAbsolute", "input.button", "input.scroll", "screen.ack", "status.battery",
+              "notifications.phonePosted", "notifications.phoneRemoved"}
 
 # CLI exit codes
 EXIT_OK = 0
@@ -478,6 +483,16 @@ def clean_text(value, limit=64):
         return ""
     value = _UNSAFE_CHARS.sub("", _LINE_BREAKS.sub(" ", value))
     return " ".join(value.split())[:limit].strip()
+
+
+_BODY_UNSAFE = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def fit_text(value, limit):
+    """Like clean_text, but a body: line breaks stay (as \\n), only controls and bidi marks go; capped."""
+    if not isinstance(value, str):
+        return ""
+    return _BODY_UNSAFE.sub("", value.replace("\r\n", "\n").replace("\r", "\n"))[:limit].strip()
 
 
 def fit_json_text(text, budget):
@@ -1809,7 +1824,12 @@ class NotificationsPlugin(Plugin):
     (pair each return's reply_serial with the call's cookie to learn the id) and NotificationClosed signals.
     Forwards only to connections whose phone listed cap "mirror". Strips markup from body. Skips its own
     "Ionix Link" notifications and config ignoreApps. Falls back to `dbus-monitor` (text output) when busctl
-    is missing or its monitor keeps failing."""
+    is missing or its monitor keeps failing.
+
+    §8.10, the other direction: a phone with cap "forward" pushes `notifications.phonePosted` / `phoneRemoved`;
+    they are posted with `notify-send` (tagged with the PHONE_HINT hint, which `_posted` refuses to mirror back),
+    kept as (connection, key) → desktop id, closed on `phoneRemoved` and when the phone leaves, and a close by
+    the user sends `phoneDismiss` back."""
 
     name = "notifications"
     any_tools = ("busctl", "dbus-monitor")
@@ -1830,9 +1850,17 @@ class NotificationsPlugin(Plugin):
         self.monitor = None
         self._busctl_failures = 0
         self._text = None          # dbus-monitor parser state
+        self.phone_ids = {}        # desktop id → (connection, key) of a phone notification we posted
+        self.phone_keys = {}       # (connection, key) → desktop id, insertion order = oldest first
+        self._phone_pending = {}   # connection → {key: (app, title, text, silent) | None to remove}, oldest push first
+        self._phone_workers = {}   # connection → the task draining its pending notifications
+        self._detached = set()     # tasks that outlive the plugin's stop: a last disconnect must not cancel them
 
     def caps(self):
-        return ["dismiss"] if tool("busctl") else []
+        caps = ["dismiss"] if tool("busctl") else []
+        if tool("notify-send"):
+            caps.append("phone")
+        return caps
 
     def _argv(self):
         busctl = tool("busctl")
@@ -1881,7 +1909,144 @@ class NotificationsPlugin(Plugin):
                                        "/org/freedesktop/Notifications", "org.freedesktop.Notifications",
                                        "CloseNotification", "u", str(nid)], timeout=5)
             return {"ok": rc == 0}
+        if t in ("notifications.phonePosted", "notifications.phoneRemoved"):
+            if "forward" not in conn.phone_caps(self.name):
+                raise LinkError(ERR_INVALID_ARGUMENT, "This phone did not list the \"forward\" cap for notifications.")
+            if not tool("notify-send"):
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, "notify-send (package libnotify) is needed to show the phone's notifications.")
+            key = b.get("key")
+            if not isinstance(key, str) or not 0 < len(key) <= PHONE_KEY_MAX:
+                raise LinkError(ERR_INVALID_ARGUMENT, f"{t} needs \"key\", the phone's notification key.")
+            if t == "notifications.phonePosted":
+                post = self._phone_fields(conn, b)
+                if post is not None:
+                    self._phone_enqueue(conn, key, post)
+            else:
+                self._phone_enqueue(conn, key, None)
+            return None
         return await super().handle(conn, msg, data)
+
+    async def on_close(self, conn):
+        """A phone left: its notifications go with it, since nothing can dismiss them from here on. Closing them
+        takes a `busctl` call each, so it happens in a task of its own (not one of the plugin's, which a last
+        disconnect cancels) and a phone that reconnects at once never waits for it."""
+        self._phone_pending.pop(conn, None)
+        ids = [self._phone_forget(c, key) for (c, key) in list(self.phone_keys) if c is conn]
+        if ids:
+            self._background(self._close_desktop_all(ids))
+
+    # Phone notifications on the desktop (§8.10)
+
+    def _background(self, coro):
+        task = asyncio.create_task(coro)
+        self._detached.add(task)
+        task.add_done_callback(self._detached_done)
+        return task
+
+    def _detached_done(self, task):
+        self._detached.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log(f"notifications: task failed: {''.join(traceback.format_exception(task.exception())).strip()}")
+
+    def _phone_forget(self, conn, key):
+        """Stop tracking `key`; returns its desktop id or None."""
+        nid = self.phone_keys.pop((conn, key), None)
+        if nid is not None:
+            self.phone_ids.pop(nid, None)
+        return nid
+
+    async def _close_desktop(self, nid):
+        busctl = tool("busctl")
+        if not busctl:
+            return
+        try:
+            await run_tool([busctl, "--user", "call", "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                            "org.freedesktop.Notifications", "CloseNotification", "u", str(nid)], timeout=3)
+        except LinkError as e:
+            log(f"notifications: could not close {nid}: {e.message}", debug=True)
+
+    async def _close_desktop_all(self, ids):
+        """Close several notifications, a few `busctl` calls at a time."""
+        gate = asyncio.Semaphore(PHONE_CLOSE_PARALLEL)
+
+        async def one(nid):
+            async with gate:
+                await self._close_desktop(nid)
+
+        await asyncio.gather(*(one(nid) for nid in ids))
+
+    def _phone_fields(self, conn, b):
+        """(app name, title, text, silent) of a phone's notification, or None when it has neither title nor text."""
+        app_name = clean_text(b.get("appName"), 128) or clean_text(b.get("app"), 128) or "Phone"
+        phone = clean_text(conn.device["name"] if conn.device else "", 64)
+        title = clean_text(b.get("title"), NOTIFY_SUMMARY_MAX)
+        text = fit_text(b.get("text"), NOTIFY_BODY_MAX)
+        if not title and not text:
+            return None
+        return (f"{app_name} · {phone}" if phone else app_name, title or app_name, text, b.get("silent") is True)
+
+    def _phone_enqueue(self, conn, key, post):
+        """Queue the newest wish for `key` (`post` from `_phone_fields`, or None to remove it) and make sure the
+        phone's worker is running. A key is queued once: a later push replaces the earlier one that has not run yet,
+        so a chatty phone costs one `notify-send` per key, not one per push."""
+        pending = self._phone_pending.setdefault(conn, {})
+        pending.pop(key, None)       # re-added at the end: the order is that of the newest push
+        pending[key] = post
+        if conn not in self._phone_workers:
+            self._phone_workers[conn] = self._background(self._phone_work(conn))
+
+    async def _phone_work(self, conn):
+        """Drain the phone's queue in order, one notification at a time."""
+        try:
+            while True:
+                pending = self._phone_pending.get(conn)
+                if not pending:
+                    self._phone_pending.pop(conn, None)
+                    return
+                key = next(iter(pending))
+                post = pending.pop(key)
+                if post is None:
+                    nid = self._phone_forget(conn, key)    # forgotten first: its close signal is ours, not the user's
+                    if nid is not None:
+                        await self._close_desktop(nid)
+                else:
+                    await self._phone_post(conn, key, post)
+        finally:
+            if self._phone_workers.get(conn) is asyncio.current_task():
+                del self._phone_workers[conn]
+
+    async def _phone_post(self, conn, key, post):
+        """notify-send --print-id [--replace-id=N] --hint=string:x-ionix-link:phone ... ; the printed id is the
+        key's desktop notification from then on."""
+        if conn not in self.connections:
+            return                     # the phone left while this waited: on_close has run
+        app_name, title, text, silent = post
+        old = self.phone_keys.get((conn, key))
+        argv = [tool("notify-send"), "--print-id", f"--app-name={app_name}", "--icon=phone",
+                f"--hint=string:{PHONE_HINT}:phone", "--urgency=low" if silent else "--urgency=normal"]
+        if old is not None:
+            argv.append(f"--replace-id={old}")
+        # `--` first: the title is the phone's text and must never be read as an option.
+        argv += ["--", title, markup_escape(text)]
+        try:
+            rc, out, err = await run_tool(argv, timeout=5)
+        except LinkError as e:
+            log(f"notifications: could not show a phone notification: {e.message}")
+            return
+        line = out.decode("utf-8", "replace").strip()
+        if rc != 0 or not line.isdigit():
+            log(f"notifications: notify-send failed ({rc}): {err.decode(errors='replace').strip()}")
+            return
+        nid = int(line)
+        if conn not in self.connections:
+            await self._close_desktop(nid)     # the phone left during notify-send, after on_close forgot its keys
+            return
+        self._phone_forget(conn, key)
+        self.phone_keys[(conn, key)] = nid
+        self.phone_ids[nid] = (conn, key)
+        mine = [k for (c, k) in self.phone_keys if c is conn]
+        for k in mine[:max(0, len(mine) - PHONE_NOTIFY_KEEP)]:
+            self._phone_forget(conn, k)
 
     # Lines from the monitor
 
@@ -1918,6 +2083,8 @@ class NotificationsPlugin(Plugin):
         self.calls[(sender, cookie)] = (args, now)
 
     def _posted(self, nid, args):
+        if nid in self.phone_ids:
+            return
         app, _, icon, summary, body, _, hints = (args + [None] * 8)[:7]
         app = app[:256] if isinstance(app, str) else ""
         ignore = {a.casefold() for a in self.daemon.config["notifications"]["ignoreApps"]}
@@ -1925,6 +2092,8 @@ class NotificationsPlugin(Plugin):
             return
         urgency = 1
         if isinstance(hints, dict):
+            if PHONE_HINT in hints:
+                return      # a phone's notification we posted ourselves: mirroring it back would loop (§8.10)
             u = hints.get("urgency")
             if isinstance(u, dict):
                 u = u.get("data")
@@ -1948,6 +2117,13 @@ class NotificationsPlugin(Plugin):
         self.spawn(self.broadcast("notifications.posted", n, phone_cap="mirror"))
 
     def _closed(self, nid, reason):
+        phone = self.phone_ids.get(nid)
+        if phone is not None:
+            conn, key = phone
+            self._phone_forget(conn, key)
+            if reason == 2 and "forward" in conn.phone_caps(self.name):     # the user closed it
+                self.spawn(conn.send("notifications.phoneDismiss", {"key": key}))
+            return
         if self.store.pop(nid, None) is None:
             return
         body = {"id": nid, "reason": self.CLOSE_REASONS.get(reason, "undefined")}
@@ -1963,7 +2139,7 @@ class NotificationsPlugin(Plugin):
     #      uint32 4
     # A message's end is only known from what it contains, so each kind is parsed once its last value is in.
 
-    HEADER = re.compile(r"^(method call|method return|signal|error) time=\S+ sender=(\S+) -> destination=(\S+) "
+    HEADER = re.compile(r"^(method call|method return|signal|error) time=\S+ sender=(\S+) -> destination=(\(null destination\)|\S+) "
                         r"serial=(\d+)(?: reply_serial=(\d+))?(?: path=[^;]*; interface=[^;]*; member=(\w+))?")
     NOTIFY_BODY = re.compile(r'   string "(.*?)"\n   uint32 (\d+)\n   string "(.*?)"\n   string "(.*?)"\n'
                              r'   string "(.*?)"\n   array \[.*\n   int32 -?\d+$', re.S)
@@ -1990,6 +2166,8 @@ class NotificationsPlugin(Plugin):
                     urgency = re.search(r'string "urgency"\n\s+variant\s+byte (\d+)', text)
                     image = re.search(r'string "image-path"\n\s+variant\s+string "(.*?)"\n', text)
                     hints = {"urgency": int(urgency.group(1))} if urgency else {}
+                    if f'string "{PHONE_HINT}"' in text:
+                        hints[PHONE_HINT] = "phone"
                     if image:
                         hints["image-path"] = image.group(1)
                     self._remember_call(m["sender"], m["serial"], [app, int(replaces), icon, summary, body, [], hints, -1])

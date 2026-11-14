@@ -12,7 +12,7 @@ Your phone, on speaking terms with your Ionix desktop. Pair once, then read the 
 ## Key Features
 
 - **Wears your desktop's theme**: the app takes its colours, corner radii and wallpaper from whatever theme is active on the desktop, and follows along when you switch. Until it has met a desktop it uses the stock Ionix purple.
-- **Notifications**: what pops up on the desktop shows up on the phone.
+- **Notifications**: what pops up on the desktop shows up on the phone, and, if you turn it on in the app's settings, what the phone gets shows up on the desktop (close it on either one and it closes on the other). Needs `notify-send` (libnotify) on the desktop.
 - **Media remote**: play, pause, skip, seek and volume for whatever is playing.
 - **Commands**: a list *you* define on the desktop, plus lock, suspend, log out, restart and shut down. The phone picks from the list and can never send a command of its own.
 - **Clipboard**: send the phone's clipboard to the desktop, or fetch the desktop's.

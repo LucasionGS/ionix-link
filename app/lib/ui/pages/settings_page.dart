@@ -11,8 +11,8 @@ import "../widgets/ion_card.dart";
 import "../widgets/ion_page.dart";
 import "pair/pair_page.dart";
 
-/// Settings: the phone's name, paired desktops (select, unpair after a confirm), pairing another one, touchpad speed,
-/// a ring test and the app and protocol version.
+/// Settings: the phone's name, paired desktops (select, unpair after a confirm), pairing another one, the phone's
+/// notifications on the desktop, touchpad speed, a ring test and the app and protocol version.
 class SettingsPage extends StatelessWidget {
   const SettingsPage({super.key});
 
@@ -26,6 +26,7 @@ class SettingsPage extends StatelessWidget {
         children: const [
           _Desktops(),
           _Phone(),
+          _PhoneNotifications(),
           _Touch(),
           _About(),
         ],
@@ -167,6 +168,118 @@ class _Phone extends StatelessWidget {
                   if (context.mounted) showMessage(context, granted ? "Notifications are on." : "Notifications are off. Turn them on in the system settings.");
                 },
               ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// The phone's own notifications on the desktop: one switch (it needs Android's notification access, which only the
+/// user can grant) and, once the feature is on, a switch per app that has posted since. Read again whenever the app
+/// resumes, because the user comes back from the system settings page.
+class _PhoneNotifications extends StatefulWidget {
+  const _PhoneNotifications();
+
+  @override
+  State<_PhoneNotifications> createState() => _PhoneNotificationsState();
+}
+
+class _PhoneNotificationsState extends State<_PhoneNotifications> with WidgetsBindingObserver {
+  bool _enabled = false;
+  bool _granted = false;
+  List<PhoneNotificationApp> _apps = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refresh();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refresh();
+  }
+
+  Future<void> _refresh() async {
+    final platform = LinkPlatform.instance;
+    final enabled = await platform.phoneNotificationsEnabled();
+    final granted = await platform.notificationAccessGranted();
+    final apps = await platform.phoneNotificationApps();
+    if (!mounted) return;
+    setState(() {
+      _enabled = enabled;
+      _granted = granted;
+      _apps = apps;
+    });
+  }
+
+  Future<void> _toggle(bool on) async {
+    final platform = LinkPlatform.instance;
+    await platform.setPhoneNotificationsEnabled(on);
+    if (on && !_granted) {
+      await platform.openNotificationAccessSettings();
+      if (mounted) showMessage(context, "Allow Ionix Link under notification access, then come back.");
+    }
+    await _refresh();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final platform = LinkPlatform.instance;
+    if (!platform.canForwardNotifications) return const SizedBox.shrink();
+    final text = Theme.of(context).textTheme;
+    final on = _enabled && _granted;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const SectionHeader("Phone notifications"),
+        IonCard(
+          blur: true,
+          padding: EdgeInsets.zero,
+          child: Column(
+            children: [
+              SwitchListTile(
+                secondary: const Icon(Icons.notifications_active_outlined),
+                title: const Text("Phone notifications on the desktop"),
+                subtitle: ValueListenableBuilder<PluginInfo?>(
+                  valueListenable: Link.notifications.remote,
+                  builder: (context, remote, _) => Text(
+                    _enabled && !_granted
+                        ? "Waiting for notification access. Android asks you to allow Ionix Link."
+                        : remote != null && !remote.has(NotificationsClient.capPhone)
+                            ? "This desktop cannot show them yet; it needs notify-send (libnotify)."
+                            : "Show what this phone gets on your desktop, and close it there to close it here.",
+                  ),
+                ),
+                value: on,
+                onChanged: _toggle,
+              ),
+              if (on && _apps.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(IonixSpace.lg, 0, IonixSpace.lg, IonixSpace.md),
+                  child: Text("Apps appear here once they post a notification.", style: text.bodySmall),
+                ),
+              if (on)
+                for (final app in _apps)
+                  SwitchListTile(
+                    dense: true,
+                    title: Text(app.name),
+                    subtitle: Text(app.package, style: text.bodySmall),
+                    value: app.allowed,
+                    onChanged: (value) async {
+                      await platform.setPhoneNotificationApp(app.package, value);
+                      await _refresh();
+                    },
+                  ),
             ],
           ),
         ),

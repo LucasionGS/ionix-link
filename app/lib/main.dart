@@ -10,6 +10,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   LinkPlatform.select();
   await LinkPlatform.instance.init();
+  Link.notifications.offerForward = LinkPlatform.instance.canForwardNotifications;
   final device = await LinkPlatform.instance.device();
   await Link.init(platformName: device.name, model: device.model);
   await PlatformGlue.start();

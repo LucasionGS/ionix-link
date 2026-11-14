@@ -43,6 +43,33 @@ class FallbackPlatform extends LinkPlatform {
   Future<void> showMessage(String title, String body) async => debugPrint("message: $title: $body");
 
   @override
+  bool get canForwardNotifications => false;
+
+  @override
+  Future<bool> notificationAccessGranted() async => false;
+
+  @override
+  Future<void> openNotificationAccessSettings() async {}
+
+  @override
+  Future<bool> phoneNotificationsEnabled() async => false;
+
+  @override
+  Future<void> setPhoneNotificationsEnabled(bool enabled) async {}
+
+  @override
+  Future<List<PhoneNotificationApp>> phoneNotificationApps() async => const [];
+
+  @override
+  Future<void> setPhoneNotificationApp(String package, bool allowed) async {}
+
+  @override
+  Stream<PhoneNotificationEvent> get phoneNotifications => const Stream.empty();
+
+  @override
+  Future<void> cancelPhoneNotification(String key) async {}
+
+  @override
   Future<BatteryState?> battery() async => null;
 
   @override

@@ -49,14 +49,14 @@ with open(CERT) as f:
 FP = FP_RAW.hex()
 HOST_ID = secrets.token_hex(16)
 HOST_NAME = "fakeix"
-DAEMON_CAPS = {"notifications": ["dismiss"], "media": ["players", "volume", "art"], "commands": [], "clipboard": [],
+DAEMON_CAPS = {"notifications": ["dismiss", "phone"], "media": ["players", "volume", "art"], "commands": [], "clipboard": [],
                "input": ["pointer", "keyboard"], "screen": ["jpeg"], "status": ["volume"], "theme": ["wallpaper"],
                "share": ["text", "files"]}
 WALLPAPER = bytes.fromhex("ffd8ffe0") + b"fake wallpaper" * 8000 + bytes.fromhex("ffd9")  # > 64 KiB on purpose
 devices = {}  # deviceId -> key bytes
 token = {"value": secrets.token_hex(16)}
 stats = {"moves": 0, "dx": 0.0, "dy": 0.0, "scrolls": 0, "buttons": [], "acks": [], "clipboard": None,
-         "battery": None, "ring": None, "connections": 0, "hellos": 0, "queries": [],
+         "battery": None, "ring": None, "connections": 0, "hellos": 0, "queries": [], "phone": [], "notificationCaps": None,
          "share": {"texts": [], "files": [], "cancelled": 0}}
 uploads = {}  # share transfer id -> {name, size, got, hash}
 theme = {"accent": "#9b59b6"}
@@ -162,6 +162,7 @@ class Conn:
         self.error("unknown_device", "This phone is not paired.", fatal=True)
         return "close"
       self.device, self.hello = dev, body
+      stats["notificationCaps"] = next((p.get("caps") for p in body.get("plugins", []) if p.get("name") == "notifications"), None)
       self.nonce = secrets.token_bytes(32)
       self.state = "challenged"
       self.send("challenge", {"nonce": self.nonce.hex()})
@@ -252,6 +253,10 @@ class Conn:
     elif typ == "notifications.list":
       reply({"notifications": [{"id": 1, "app": "test", "summary": "Hi", "body": "there", "urgency": "normal",
                                 "time": int(time.time() * 1000)}]})
+    elif typ in ("notifications.phonePosted", "notifications.phoneRemoved"):
+      stats["phone"].append({"type": typ, "body": body})
+    elif typ == "debug.phoneDismiss":
+      reply({"ok": True}); self.send("notifications.phoneDismiss", {"key": body["key"]})
     elif typ == "clipboard.pull":
       reply({"text": "from desktop"})
     elif typ == "clipboard.push":

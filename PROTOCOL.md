@@ -311,6 +311,8 @@ Desktop notifications mirrored to the phone. The phone lists the plugin (caps `[
 | `notifications.list` | P→D | request | `{}` → reply `notifications: [Notification]`: ones seen while a phone has been connected and not closed, oldest first, at most 50. The daemon watches the bus only while at least one phone is connected, and forgets the list when the last one leaves. |
 | `notifications.dismiss` | P→D | request | `id: int` → reply `ok: bool` (best effort: `CloseNotification` via `busctl --user call`; `false` if the server refused). |
 
+The other direction, the phone's own notifications shown on the desktop, is 8.10.
+
 ### 8.2 `media`
 
 Caps: `players` (playerctl present), `volume` (wpctl present), `art` (`players` plus `magick` or `ffmpeg` to scale covers). Present if either of the first two.
@@ -458,6 +460,24 @@ Where files go: `$IONIX_LINK_DOWNLOAD_DIR`, else `xdg-user-dir DOWNLOAD`, else `
 | `share.cancel` | P→D | request | `transfer: str` → `{}`. Idempotent: an unknown transfer is also `{}`. |
 
 A disconnect cancels the transfer, and so does 60 s without a chunk (time the desktop spends writing does not count). A cancel or disconnect that arrives once the file has been linked into place is too late: the file stays and a waiting `share.end` still gets its reply. While transfers are open, `share.begin` counts the bytes they have still to write against the free space, and the desktop checks the free space again every 64 MiB of a file, failing it with `failed` (part file deleted) before the margin is used up. Part files a killed daemon left behind are deleted when they are over 60 s old and no transfer owns them. While a transfer is open the device's entry in `state.json` (§10) carries `transfers: [{ "id": str, "name": str, "size": int, "received": int }]`, updated at most once a second; the field is absent when idle.
+
+### 8.10 Phone notifications
+
+The phone's notifications shown on the desktop, part of the `notifications` plugin. Phone cap `forward`: the app can forward its notifications (Android, where it can ask for notification access; it is advertised whenever the app is able to, and whether the user has granted access and turned the feature on is the phone's own business: with it off, nothing is sent). Daemon cap `phone`: it can post notifications (`notify-send`, package libnotify). The daemon ignores `phonePosted`/`phoneRemoved` from a phone that did not list `forward`.
+
+| Type | Dir | Kind | Body |
+|---|---|---|---|
+| `notifications.phonePosted` | P→D | push | `key: str` (Android's `StatusBarNotification` key, 1 to 1024 characters; the phone's identity for the notification) · `app: str` (package) · `appName: str` (label shown to the user) · `title: str` · `text: str` · `time: int` (Unix ms) · `silent: bool?` (low importance: shown with urgency `low`). The same `key` again is an update. |
+| `notifications.phoneRemoved` | P→D | push | `key: str`. The phone dismissed or the app withdrew it. |
+| `notifications.phoneDismiss` | D→P | push | `key: str`. The user closed it on the desktop (`NotificationClosed` reason 2, "dismissed by the user"). The phone cancels it if Android lets it; a notification that cannot be cancelled is left alone without a reply. Not sent for a close the daemon made itself, or for an expiry. |
+
+Rules:
+
+- The phone sends only text and only after its own filters (apps the user switched off, ongoing and foreground-service notifications, group summaries, its own notifications, `VISIBILITY_SECRET`). Nothing is sent for a phone notification that was already open when the connection began.
+- The daemon shows each one through the session's notification server as app name `<appName> · <phone name>` (control characters and line breaks removed), summary `title` (at most 512 characters), body `text` (markup escaped, at most 4096 characters, line breaks kept) and the icon `phone`. It remembers `key → desktop id` per connection, replaces the desktop notification on an update (`replaces_id`), and closes it (`CloseNotification`, which needs `busctl`) on `phoneRemoved`. At most 100 are tracked per phone; the oldest simply stop being tracked.
+- When the connection closes, every notification of that phone is closed on the desktop: nothing can dismiss or update a stale one any more.
+- **No loop.** The daemon mirrors desktop notifications to the phone (8.1), so it must not mirror these back. Every notification it posts for a phone carries the hint `x-ionix-link`, and `notifications.posted` is never sent for a `Notify` call that has it, nor for an id the daemon tracks as a phone notification. Closing one (by the user, `phoneRemoved` or a disconnect) is not sent as `notifications.closed` either.
+- The phone sends a `phonePosted` only while the connection is `ready` and the daemon has cap `phone`; the daemon's message limits (section 2) apply, so `title` and `text` are cut by the phone to 512 and 4096 characters.
 
 ## 9. Control socket (CLI ↔ daemon)
 

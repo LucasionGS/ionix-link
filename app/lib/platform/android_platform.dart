@@ -144,6 +144,66 @@ class AndroidPlatform extends LinkPlatform {
     );
   }
 
+  // PhoneNotifications.kt answers the methods and feeds the events; LinkNotificationListener.kt is what reads them.
+  static const MethodChannel _phoneMethods = MethodChannel("dev.ionnet.ionix_link/phone_notifications");
+  static const EventChannel _phoneEvents = EventChannel("dev.ionnet.ionix_link/phone_notifications/events");
+
+  @override
+  bool get canForwardNotifications => true;
+
+  @override
+  Future<bool> notificationAccessGranted() async => await _phoneMethods.invokeMethod<bool>("isAccessGranted") ?? false;
+
+  @override
+  Future<void> openNotificationAccessSettings() => _phoneMethods.invokeMethod<void>("openAccessSettings");
+
+  @override
+  Future<bool> phoneNotificationsEnabled() async => await _phoneMethods.invokeMethod<bool>("isEnabled") ?? false;
+
+  @override
+  Future<void> setPhoneNotificationsEnabled(bool enabled) => _phoneMethods.invokeMethod<void>("setEnabled", enabled);
+
+  @override
+  Future<List<PhoneNotificationApp>> phoneNotificationApps() async {
+    final list = await _phoneMethods.invokeListMethod<Map<Object?, Object?>>("apps") ?? const [];
+    return [
+      for (final entry in list)
+        PhoneNotificationApp(package: entry["package"] as String? ?? "", name: entry["name"] as String? ?? "", allowed: entry["allowed"] != false),
+    ];
+  }
+
+  @override
+  Future<void> setPhoneNotificationApp(String package, bool allowed) {
+    return _phoneMethods.invokeMethod<void>("setAppAllowed", {"package": package, "allowed": allowed});
+  }
+
+  @override
+  Stream<PhoneNotificationEvent> get phoneNotifications {
+    return _phoneEvents.receiveBroadcastStream().map((event) => _phoneEvent(event as Map<Object?, Object?>)).where((event) => event != null).cast<PhoneNotificationEvent>();
+  }
+
+  static PhoneNotificationEvent? _phoneEvent(Map<Object?, Object?> event) {
+    final key = event["key"];
+    if (key is! String || key.isEmpty) return null;
+    if (event["event"] == "removed") return PhoneNotificationEvent(key: key);
+    final time = event["time"];
+    return PhoneNotificationEvent(
+      key: key,
+      posted: PhoneNotification(
+        key: key,
+        app: event["app"] as String? ?? "",
+        appName: event["appName"] as String? ?? "",
+        title: event["title"] as String? ?? "",
+        text: event["text"] as String? ?? "",
+        time: time is int ? DateTime.fromMillisecondsSinceEpoch(time) : DateTime.now(),
+        silent: event["silent"] == true,
+      ),
+    );
+  }
+
+  @override
+  Future<void> cancelPhoneNotification(String key) => _phoneMethods.invokeMethod<void>("cancel", key);
+
   @override
   Future<BatteryState?> battery() async {
     try {
