@@ -136,6 +136,7 @@ class _ScreenPageState extends State<ScreenPage> {
   @override
   void initState() {
     super.initState();
+    ScreenAwake.hold();
     _frames = _screen.frames.listen((frame) {
       _framesThisSecond++;
       if (mounted) setState(() => _frame = frame);
@@ -161,6 +162,7 @@ class _ScreenPageState extends State<ScreenPage> {
 
   @override
   void dispose() {
+    ScreenAwake.release();
     _clusterTimer?.cancel();
     final shell = _shell?..removeListener(_onShell);
     if (_full) {

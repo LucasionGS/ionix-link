@@ -86,6 +86,10 @@ void main() {
     expect(Link.media.active!.identity, "Spotify");
     await waitFor(Link.media.volume, (volume) => volume != null, what: "media.volume");
     expect(Link.media.volume.value!.volume, 0.5);
+    // Cover art: fetched once through media.art, then served from the cache.
+    final cover = await Link.media.art(Link.media.active!);
+    expect(cover?.first, 0xff);
+    expect(await Link.media.art(Link.media.active!), same(cover));
     await waitFor(Link.commands.commands, (commands) => commands.isNotEmpty, what: "commands.list");
     expect(Link.commands.commands.value.single.group, "Tests");
     await waitFor(Link.notifications.active, (list) => list.isNotEmpty, what: "notifications.list");

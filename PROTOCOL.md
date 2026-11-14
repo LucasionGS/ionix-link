@@ -313,7 +313,7 @@ Desktop notifications mirrored to the phone. The phone lists the plugin (caps `[
 
 ### 8.2 `media`
 
-Caps: `players` (playerctl present), `volume` (wpctl present). Present if either.
+Caps: `players` (playerctl present), `volume` (wpctl present), `art` (`players` plus `magick` or `ffmpeg` to scale covers). Present if either of the first two.
 
 `Player` object:
 
@@ -327,7 +327,7 @@ Caps: `players` (playerctl present), `volume` (wpctl present). Present if either
 | `position` | int? | Position when sampled, ms. |
 | `positionTime` | int | When `position` was sampled, Unix ms. The phone extrapolates while `playing`: `position + (now - positionTime)`, capped at `length`. |
 | `canSeek` / `canNext` / `canPrevious` / `canPlay` / `canPause` | bool | MPRIS `Can*`. |
-| `artUrl` | str? | `mpris:artUrl` as given. Not fetched in v1. |
+| `artUrl` | str? | `mpris:artUrl` as given. The phone never fetches it itself; it asks `media.art`, and keys its cache on this string. |
 
 `Volume` object: `volume: float` · `muted: bool` (default sink, `wpctl get-volume @DEFAULT_AUDIO_SINK@`).
 
@@ -338,6 +338,7 @@ Caps: `players` (playerctl present), `volume` (wpctl present). Present if either
 | `media.seek` | P→D | request | `player: str?` · `position: int` (absolute, ms) → reply `ok: bool` |
 | `media.volume` | D→P push, P→D request | both | push and reply: `Volume`. Pushed on change. Request body `{}`. |
 | `media.setVolume` | P→D | request | `volume: float?` (absolute, clamped 0..1.5) · `muted: bool?` — at least one → reply `Volume` (new state) |
+| `media.art` | P→D | request | `player: str?` (default `active`) · `maxSize: int` (longest edge, px, 64..1024) → reply as a **binary frame**, header body `format: "jpeg"` · `w: int` · `h: int` · `artUrl: str` (the cover this is, so a reply that crosses a track change is recognised), data = the JPEG. Only with cap `art`, else `plugin_unavailable`. `not_found`: unknown player, no `artUrl`, an unreadable or non-regular file, or a scheme other than `file`, `http`, `https`. `failed`: download error, over 16 MiB, or not a JPEG, PNG, GIF, BMP or WebP by its leading bytes (checked before any tool sees it). `timeout`: download over 15 s. The daemon keeps the last 16 scaled covers. |
 
 ### 8.3 `commands`
 

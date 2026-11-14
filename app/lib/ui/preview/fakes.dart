@@ -91,7 +91,7 @@ class FakeThemeSource extends ThemeSource {
 class FakeMediaSource extends MediaSource {
   FakeMediaSource({bool two = false}) {
     players = ValueNotifier([
-      _player("spotify", "Spotify", "Night Drive", "Neon Harbor", "Glass Coast"),
+      _player("spotify", "Spotify", "Night Drive", "Neon Harbor", "Glass Coast", artUrl: "file:///preview/night-drive.png"),
       if (two) _player("firefox", "Firefox", "Lo-fi beats to build to", "Various", "Stream"),
     ]);
   }
@@ -103,7 +103,7 @@ class FakeMediaSource extends MediaSource {
   @override
   final ValueNotifier<VolumeState?> volume = ValueNotifier(const VolumeState(volume: 0.62, muted: false));
 
-  static MediaPlayer _player(String name, String identity, String title, String artist, String album) {
+  static MediaPlayer _player(String name, String identity, String title, String artist, String album, {String? artUrl}) {
     return MediaPlayer(
       name: name,
       identity: identity,
@@ -119,11 +119,33 @@ class FakeMediaSource extends MediaSource {
       canPrevious: true,
       canPlay: true,
       canPause: true,
+      artUrl: artUrl,
     );
   }
 
   @override
   Future<void> refresh() async {}
+
+  Future<Uint8List>? _cover;
+
+  @override
+  Future<Uint8List?> art(MediaPlayer player) async => player.artUrl == null ? null : await (_cover ??= _drawCover());
+
+  /// A made-up album cover (sunset over water), as PNG bytes.
+  static Future<Uint8List> _drawCover() async {
+    final recorder = ui.PictureRecorder();
+    final canvas = ui.Canvas(recorder);
+    const s = 512.0;
+    canvas.drawRect(const Rect.fromLTWH(0, 0, s, s), Paint()..shader = ui.Gradient.linear(Offset.zero, const Offset(0, s), const [Color(0xFF2A0F45), Color(0xFFE0457B), Color(0xFFFFB86B)], const [0.0, 0.62, 1.0]));
+    canvas.drawCircle(const Offset(s / 2, s * 0.62), s * 0.22, Paint()..color = const Color(0xFFFFE3A3));
+    canvas.drawRect(const Rect.fromLTWH(0, s * 0.68, s, s * 0.32), Paint()..shader = ui.Gradient.linear(const Offset(0, s * 0.68), const Offset(0, s), const [Color(0xFF14325C), Color(0xFF0F0A18)]));
+    for (var i = 0; i < 6; i++) {
+      canvas.drawRect(Rect.fromLTWH(s * (0.3 + i * 0.015), s * (0.72 + i * 0.04), s * (0.4 - i * 0.03), 4), Paint()..color = const Color(0x66FFE3A3));
+    }
+    final image = await recorder.endRecording().toImage(s.toInt(), s.toInt());
+    final data = await image.toByteData(format: ui.ImageByteFormat.png);
+    return data!.buffer.asUint8List();
+  }
 
   @override
   Future<void> control(MediaAction action, {String? player}) async {}

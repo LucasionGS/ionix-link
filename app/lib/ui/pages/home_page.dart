@@ -8,6 +8,7 @@ import "../sources.dart";
 import "../theme.dart";
 import "../widgets/adaptive_scaffold.dart";
 import "../widgets/connection_banner.dart";
+import "../widgets/cover_art.dart";
 import "../widgets/empty_state.dart";
 import "../widgets/floating_bar.dart";
 import "../widgets/ion_card.dart";
@@ -222,11 +223,7 @@ class _NowPlayingState extends State<_NowPlaying> {
               onTap: () => ShellScope.of(context).openPage(LinkPlugins.media),
               child: Row(
                 children: [
-                  Container(
-                    width: art,
-                    height: art,
-                    decoration: BoxDecoration(borderRadius: BorderRadius.circular(t.radiusSm + 2), gradient: LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight, colors: [t.accent, t.cyan])),
-                  ),
+                  CoverArt(player: player, size: art, radius: BorderRadius.circular(t.radiusSm + 2)),
                   const SizedBox(width: IonixSpace.md),
                   Expanded(
                     child: Column(

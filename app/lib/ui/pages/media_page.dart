@@ -5,6 +5,7 @@ import "package:material_ui/material_ui.dart";
 import "../../link/link.dart";
 import "../sources.dart";
 import "../theme.dart";
+import "../widgets/cover_art.dart";
 import "../widgets/empty_state.dart";
 import "../widgets/fold_split.dart";
 import "../widgets/ion_card.dart";
@@ -162,11 +163,11 @@ class _Track extends StatelessWidget {
             // in landscape) full-size artwork would push the transport controls off the bottom.
             final room = MediaQuery.sizeOf(context).height * 0.26;
             final side = (constraints.maxWidth.isFinite ? constraints.maxWidth : 240.0).clamp(96.0, room.clamp(96.0, 220.0));
-            return Container(
-              width: side,
-              height: side,
-              decoration: BoxDecoration(borderRadius: BorderRadius.circular(t.radiusPanel), gradient: LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight, colors: [t.accent.withValues(alpha: 0.85), t.cyan.withValues(alpha: 0.85)])),
-              child: Icon(player.status == MediaStatus.stopped ? Icons.stop_circle_outlined : Icons.music_note_outlined, size: side * 0.4, color: t.onColor(t.accent)),
+            return CoverArt(
+              player: player,
+              size: side,
+              radius: BorderRadius.circular(t.radiusPanel),
+              icon: player.status == MediaStatus.stopped ? Icons.stop_circle_outlined : Icons.music_note_outlined,
             );
           },
         ),

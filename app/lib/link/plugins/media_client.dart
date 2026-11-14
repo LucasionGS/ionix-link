@@ -1,3 +1,5 @@
+import "dart:async";
+
 import "package:flutter/foundation.dart";
 
 import "../connection/link_connection.dart";
@@ -15,6 +17,7 @@ class MediaClient extends PluginClient {
   static const String typeSeek = "media.seek";
   static const String typeVolume = "media.volume";
   static const String typeSetVolume = "media.setVolume";
+  static const String typeArt = "media.art";
 
   /// Daemon cap: players (playerctl).
   static const String capPlayers = "players";
@@ -22,12 +25,26 @@ class MediaClient extends PluginClient {
   /// Daemon cap: volume (wpctl).
   static const String capVolume = "volume";
 
+  /// Daemon cap: cover art (`media.art`).
+  static const String capArt = "art";
+
+  /// Longest edge, px, of the covers [art] asks for: the media page shows them at up to 220 dp.
+  static const int artSize = 512;
+
+  /// Covers kept in memory, by `artUrl`.
+  static const int _artCacheSize = 12;
+
   @override
   String get name => LinkPlugins.media;
 
   final ValueNotifier<List<MediaPlayer>> _players = ValueNotifier(const []);
   final ValueNotifier<String?> _activePlayer = ValueNotifier(null);
   final ValueNotifier<VolumeState?> _volume = ValueNotifier(null);
+
+  // artUrl → JPEG, least recently used first; null = the desktop could not send that cover, so it is not asked again
+  // until the next connection.
+  final Map<String, Uint8List?> _art = {};
+  final Map<String, Future<Uint8List?>> _artLoading = {};
 
   /// All players, as last pushed. Empty while detached.
   ValueListenable<List<MediaPlayer>> get players => _players;
@@ -75,6 +92,39 @@ class MediaClient extends PluginClient {
   /// Highest volume [setVolume] sends (150 %).
   static const double maxVolume = 1.5;
 
+  /// The cover of [player]'s current track as JPEG bytes, or null when it has none, the desktop cannot send covers, or
+  /// fetching it failed. Cached per `artUrl`, and one request at a time per cover.
+  Future<Uint8List?> art(MediaPlayer player) {
+    final url = player.artUrl;
+    if (url == null || !isAvailable || !hasCap(capArt)) return Future.value(null);
+    if (_art.containsKey(url)) {
+      final bytes = _art.remove(url);
+      _art[url] = bytes;
+      return Future.value(bytes);
+    }
+    // A block body: `=> _artLoading.remove(url)` would hand whenComplete this very future to wait on, forever.
+    return _artLoading[url] ??= _fetchArt(player.name, url).whenComplete(() {
+      _artLoading.remove(url);
+    });
+  }
+
+  Future<Uint8List?> _fetchArt(String player, String url) async {
+    Uint8List? bytes;
+    try {
+      final reply = await requestMessage(typeArt, {"player": player, "maxSize": artSize});
+      // The track may have changed while the desktop fetched; a cover for another URL is not this one.
+      if (reply.body["artUrl"] == url && reply.data != null && reply.data!.isNotEmpty) bytes = reply.data;
+    } on LinkException catch (error) {
+      debugPrint("ionix-link: no cover for $url: ${error.message}");
+    }
+    if (!isAvailable) return bytes;
+    _art[url] = bytes;
+    while (_art.length > _artCacheSize) {
+      _art.remove(_art.keys.first);
+    }
+    return bytes;
+  }
+
   /// Mute or unmute. Returns the new state.
   Future<VolumeState> setMuted(bool muted) async {
     return _applyVolume(await request(typeSetVolume, {"muted": muted}));
@@ -92,6 +142,8 @@ class MediaClient extends PluginClient {
     _players.value = const [];
     _activePlayer.value = null;
     _volume.value = null;
+    // Covers that failed may work on the next connection; the ones that arrived stay.
+    _art.removeWhere((_, bytes) => bytes == null);
   }
 
   void _applyPlayers(Map<String, dynamic> body) {
@@ -182,7 +234,7 @@ class MediaPlayer {
   final bool canPlay;
   final bool canPause;
 
-  /// `mpris:artUrl` as given; not fetched in v1.
+  /// `mpris:artUrl` as given. The phone never fetches it itself: [MediaClient.art] asks the desktop.
   final String? artUrl;
 
   /// Position extrapolated to [now] while playing, capped at [length]; [position] otherwise.

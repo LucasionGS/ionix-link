@@ -202,6 +202,9 @@ abstract class MediaSource {
   Future<VolumeState> setVolume(double volume);
   Future<VolumeState> setMuted(bool muted);
 
+  /// [player]'s cover as JPEG bytes, null when there is none.
+  Future<Uint8List?> art(MediaPlayer player);
+
   /// [player]'s position at [now], extrapolated while playing.
   Duration? positionOf(MediaPlayer player, DateTime now);
 }
@@ -219,6 +222,9 @@ class LinkMediaSource extends MediaSource {
 
   @override
   Future<void> refresh() => Link.media.refresh();
+
+  @override
+  Future<Uint8List?> art(MediaPlayer player) => Link.media.art(player);
 
   @override
   Future<void> control(MediaAction action, {String? player}) => Link.media.control(action, player: player);
@@ -308,6 +314,29 @@ class LinkInputSource extends InputSource {
 //#endregion
 
 //#region Screen
+
+/// Keeps the phone's screen on while any page holds it (the touchpad and the screen view), counted so that two holders
+/// overlapping in a page transition do not switch it off early.
+class ScreenAwake {
+  ScreenAwake._();
+
+  static int _holders = 0;
+
+  /// Start keeping the screen on; pair with one [release].
+  static void hold() {
+    if (_holders++ == 0) _apply(true);
+  }
+
+  /// Undo one [hold].
+  static void release() {
+    if (_holders == 0) return;
+    if (--_holders == 0) _apply(false);
+  }
+
+  static void _apply(bool on) {
+    LinkPlatform.instance.setKeepScreenOn(on).catchError((Object error) => debugPrint("ionix-link: keep screen on: $error"));
+  }
+}
 
 /// The screen plugin.
 abstract class ScreenSource {

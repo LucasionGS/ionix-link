@@ -53,6 +53,7 @@ import shutil
 import signal
 import socket
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -60,6 +61,7 @@ import tempfile
 import time
 import traceback
 import urllib.parse
+import urllib.request
 
 VERSION = "0.1.0"
 
@@ -105,6 +107,10 @@ COMMAND_TIMEOUT_MAX = 25           # s, so the reply still beats the phone's 30 
 COMMAND_OUTPUT_TAIL = 4096         # bytes of output returned with showOutput
 SCREEN_STALL = 30                  # s without screen.ack → screen.stopped "stalled"
 THEME_POLL = 2                     # s between theme file checks
+ART_FETCH_MAX = 16 * 1024 * 1024   # bytes of cover art read from a file or URL before giving up
+ART_FETCH_TIMEOUT = 5              # s per socket operation of an http(s) cover download ...
+ART_FETCH_TOTAL = 15               # ... and for the whole download
+ART_CACHE = 16                     # scaled covers kept, by (artUrl, maxSize)
 
 # Error codes (§7). Fatal ones close the connection after the error frame.
 ERR_BAD_FRAME = "bad_frame"
@@ -486,6 +492,90 @@ def strip_markup(text):
     """Notification body markup (`<b>`, `<a href>`, `<br>`) → plain text, entities decoded."""
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     return html.unescape(re.sub(r"<[^>]*>", "", text))
+
+
+def image_scaler():
+    """("magick" | "ffmpeg", path) of the tool that scales pictures, or None."""
+    for name in ("magick", "ffmpeg"):
+        path = tool(name)
+        if path:
+            return name, path
+    return None
+
+
+# Leading bytes of each format a fetched picture may be in, with magick's coder for it. Anything else is refused
+# before a scaler sees it, so a cover URL can never make magick run one of its script-like coders (MVG, MSL, text).
+IMAGE_MAGIC = ((b"\xff\xd8\xff", "jpeg"), (b"\x89PNG\r\n\x1a\n", "png"), (b"GIF87a", "gif"), (b"GIF89a", "gif"),
+               (b"BM", "bmp"))
+
+
+def image_format(data):
+    """magick's coder name for a JPEG, PNG, GIF, BMP or WebP picture, or None for anything else."""
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    for magic, name in IMAGE_MAGIC:
+        if data.startswith(magic):
+            return name
+    return None
+
+
+async def scale_to_jpeg(scaler, max_size, what, path=None, data=None, coder=None):
+    """A JPEG of the picture at `path`, or of `data` in magick coder `coder`, at most `max_size` px on its longest
+    edge (never enlarged). `what` names the picture in errors. Raises LinkError(failed) with the tool's last line."""
+    name, exe = scaler
+    if name == "magick":
+        source = f"{path}[0]" if path is not None else f"{coder}:-[0]"
+        argv = [exe, source, "-auto-orient", "-resize", f"{max_size}x{max_size}>", "-strip", "-quality", "80", "jpeg:-"]
+    else:
+        argv = [exe, "-v", "error"] + (["-nostdin", "-i", path] if path is not None else ["-i", "pipe:0"]) + [
+            "-frames:v", "1", "-vf",
+            f"scale=w='min(iw,{max_size})':h='min(ih,{max_size})':force_original_aspect_ratio=decrease",
+            "-q:v", "4", "-f", "image2pipe", "-c:v", "mjpeg", "-"]
+    rc, jpeg, err = await run_tool(argv, stdin=data if path is None else None, timeout=30)
+    if rc != 0 or not jpeg.startswith(b"\xff\xd8"):
+        lines = err.decode("utf-8", "replace").strip().splitlines()
+        raise LinkError(ERR_FAILED, f"{name} could not scale {what}: {lines[-1] if lines else 'no output'}",
+                        details={"exitCode": rc})
+    return jpeg
+
+
+def _read_art_file(path):
+    # O_NONBLOCK: opening a FIFO someone named as cover art must not hang the thread; only regular files are read.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        raise LinkError(ERR_NOT_FOUND, f"Cannot read the cover art {path}: {e.strerror or e}.")
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise LinkError(ERR_NOT_FOUND, f"The cover art {path} is not a regular file.")
+        return f.read(ART_FETCH_MAX + 1)
+
+
+def _download_art(url):
+    request = urllib.request.Request(url, headers={"User-Agent": f"ionix-link/{VERSION}"})
+    try:
+        with urllib.request.urlopen(request, timeout=ART_FETCH_TIMEOUT) as response:
+            return response.read(ART_FETCH_MAX + 1)
+    except (OSError, ValueError) as e:     # URLError and HTTPError are OSErrors
+        raise LinkError(ERR_FAILED, f"Could not download the cover art from {url}: {e}.")
+
+
+async def fetch_art(url):
+    """The bytes of an `mpris:artUrl`: a file:// path or an http(s) URL, at most ART_FETCH_MAX. Raises LinkError."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "file":
+        data = await asyncio.to_thread(_read_art_file, urllib.parse.unquote(parsed.path))
+    elif parsed.scheme in ("http", "https"):
+        try:
+            data = await asyncio.wait_for(asyncio.to_thread(_download_art, url), ART_FETCH_TOTAL)
+        except TimeoutError:
+            raise LinkError(ERR_TIMEOUT, f"The cover art from {url} did not download within {ART_FETCH_TOTAL} s.")
+    else:
+        raise LinkError(ERR_NOT_FOUND, f"Cover art from {parsed.scheme or 'scheme-less'} URLs is not supported, only file, "
+                                       "http and https.")
+    if len(data) > ART_FETCH_MAX:
+        raise LinkError(ERR_FAILED, f"The cover art at {url} is over {ART_FETCH_MAX // (1024 * 1024)} MiB.")
+    return data
 
 
 def jpeg_size(data):
@@ -1937,6 +2027,7 @@ class MediaPlugin(Plugin):
         self._last_key = None
         self._last_playing = None
         self._statuses = {}
+        self._art = {}             # (artUrl, maxSize) → (header body, jpeg), least recently used first
 
     def caps(self):
         caps = []
@@ -1944,6 +2035,8 @@ class MediaPlugin(Plugin):
             caps.append("players")
         if tool("wpctl"):
             caps.append("volume")
+        if "players" in caps and image_scaler():
+            caps.append("art")
         return caps
 
     async def start(self):
@@ -2036,7 +2129,40 @@ class MediaPlugin(Plugin):
             if v is None:
                 raise LinkError(ERR_FAILED, "Could not read the volume back with wpctl.")
             return v
+        if t == "media.art":
+            if "art" not in conn.plugins["media"]["caps"]:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, "The desktop cannot send cover art (needs playerctl and magick or ffmpeg).")
+            max_size = b.get("maxSize")
+            if not is_int(max_size) or not 64 <= max_size <= 1024:
+                raise LinkError(ERR_INVALID_ARGUMENT, "\"maxSize\" must be an integer from 64 to 1024.")
+            player = await self._player_arg(b)
+            url = next((p.get("artUrl") for p in self.players if p["name"] == player), None)
+            if not url:
+                raise LinkError(ERR_NOT_FOUND, f"{player} shows no cover art for this track.")
+            body, jpeg = await self._art_for(url, max_size)
+            return dict(body), jpeg
         return await super().handle(conn, msg, data)
+
+    async def _art_for(self, url, max_size):
+        """(header body, jpeg) of the cover at `url`, scaled to `max_size`; the last ART_CACHE are kept, since the phone
+        asks again for the same cover after every reconnect and on each player page."""
+        key = (url, max_size)
+        cached = self._art.pop(key, None)
+        if cached is None:
+            data = await fetch_art(url)
+            coder = image_format(data)
+            if coder is None:
+                raise LinkError(ERR_FAILED, f"The cover art at {url} is not a JPEG, PNG, GIF, BMP or WebP picture.")
+            scaler = image_scaler()
+            if scaler is None:
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, "Neither magick nor ffmpeg is installed to scale cover art.")
+            jpeg = await scale_to_jpeg(scaler, max_size, f"the cover art at {url}", data=data, coder=coder)
+            w, h = jpeg_size(jpeg) or (0, 0)
+            cached = ({"format": "jpeg", "w": w, "h": h, "artUrl": url}, jpeg)
+        self._art[key] = cached
+        while len(self._art) > ART_CACHE:
+            del self._art[next(iter(self._art))]
+        return cached
 
     def _need(self, name):
         path = tool(name)
@@ -3169,16 +3295,8 @@ class ThemePlugin(Plugin):
         self._hash_cache = (None, None)
         self._lock = asyncio.Lock()
 
-    def scaler(self):
-        """("magick" | "ffmpeg", path), or None."""
-        for name in ("magick", "ffmpeg"):
-            path = tool(name)
-            if path:
-                return name, path
-        return None
-
     def caps(self):
-        return ["wallpaper"] if self.wallpaper and self.scaler() else []
+        return ["wallpaper"] if self.wallpaper and image_scaler() else []
 
     async def prepare(self):
         # The cap depends on whether a wallpaper is known right now.
@@ -3210,23 +3328,12 @@ class ThemePlugin(Plugin):
             if not is_int(max_size) or not 256 <= max_size <= 2048:
                 raise LinkError(ERR_INVALID_ARGUMENT, "\"maxSize\" must be an integer from 256 to 2048.")
             theme = await self.refresh(push=True)
-            path, scaler = self.wallpaper, self.scaler()
+            path, scaler = self.wallpaper, image_scaler()
             if not path:
                 raise LinkError(ERR_NOT_FOUND, "No wallpaper is showing (awww query names none).")
             if scaler is None:
                 raise LinkError(ERR_PLUGIN_UNAVAILABLE, "Neither magick nor ffmpeg is installed to scale the wallpaper.")
-            if scaler[0] == "magick":
-                argv = [scaler[1], f"{path}[0]", "-auto-orient", "-resize", f"{max_size}x{max_size}>", "-strip",
-                        "-quality", "80", "jpeg:-"]
-            else:
-                argv = [scaler[1], "-v", "error", "-nostdin", "-i", path, "-frames:v", "1", "-vf",
-                        f"scale=w='min(iw,{max_size})':h='min(ih,{max_size})':force_original_aspect_ratio=decrease",
-                        "-q:v", "4", "-f", "image2pipe", "-c:v", "mjpeg", "-"]
-            rc, jpeg, err = await run_tool(argv, timeout=30)
-            if rc != 0 or not jpeg.startswith(b"\xff\xd8"):
-                lines = err.decode("utf-8", "replace").strip().splitlines()
-                raise LinkError(ERR_FAILED, f"{scaler[0]} could not scale {path}: {lines[-1] if lines else 'no output'}",
-                                details={"exitCode": rc})
+            jpeg = await scale_to_jpeg(scaler, max_size, path, path=path)
             w, h = jpeg_size(jpeg) or (0, 0)
             return {"format": "jpeg", "w": w, "h": h, "wallpaper": theme.get("wallpaper", "")}, jpeg
         return await super().handle(conn, msg, data)

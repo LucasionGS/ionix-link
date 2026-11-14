@@ -70,4 +70,7 @@ class FallbackPlatform extends LinkPlatform {
 
   @override
   Future<String> getClipboard() async => (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? "";
+
+  @override
+  Future<void> setKeepScreenOn(bool on) async {}
 }

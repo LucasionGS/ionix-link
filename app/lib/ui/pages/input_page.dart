@@ -22,6 +22,18 @@ class _InputPageState extends State<InputPage> {
   final InputSource _input = UiSources.input;
 
   @override
+  void initState() {
+    super.initState();
+    ScreenAwake.hold();
+  }
+
+  @override
+  void dispose() {
+    ScreenAwake.release();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final pad = _input.hasPointer
         ? const Padding(padding: EdgeInsets.all(IonixSpace.md), child: Touchpad())

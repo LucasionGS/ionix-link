@@ -7,6 +7,7 @@ Phone companion for the Ionix desktop. The wire contract is `PROTOCOL.md`; this 
 ```
 bin/ionix-link                 Desktop daemon + CLI, one stdlib-only Python 3 file, executable
 systemd/ionix-link.service     User unit, graphical-session.target, Restart=on-failure
+migrations/user/004-ionix-link Ionix user migration: enables the unit once for accounts older than the skel link
 PROTOCOL.md                    Wire spec (framing, handshake, every message, files, control socket)
 STRUCTURE.md                   This file
 README.md                      For users
@@ -161,7 +162,7 @@ inside `<application>`:
 
 ## Packaging and the ISO (later)
 
-`PKGBUILD` (working tree, for the ISO) and `packaging/aur/PKGBUILD` (`ionix-link-git`), installing `bin/ionix-link` → `/usr/bin`, `systemd/ionix-link.service` → `/usr/lib/systemd/user/`. Depends: `python`, `openssl`, `systemd`. Optdepends: `qrencode`, `playerctl`, `wireplumber`, `libpulse` (pactl), `wl-clipboard`, `wtype`, `grim`, `libnotify`, `hyprland`, `wlr-randr`. In ionix-iso: `LOCAL_PACKAGES` in `aur/build-aur.sh`, a `packages.x86_64` line, and enabling the unit through a skel `graphical-session.target.wants` link.
+`PKGBUILD` (working tree, for the ISO) and `packaging/aur/PKGBUILD` (`ionix-link-git`), installing `bin/ionix-link` → `/usr/bin`, `systemd/ionix-link.service` → `/usr/lib/systemd/user/`. Depends: `python`, `openssl`, `systemd`. Optdepends: `qrencode`, `playerctl`, `wireplumber`, `libpulse` (pactl), `wl-clipboard`, `wtype`, `grim`, `libnotify`, `hyprland`, `wlr-randr`. In ionix-iso: `LOCAL_PACKAGES` in `aur/build-aur.sh`, a `packages.x86_64` line, and enabling the unit through a skel `graphical-session.target.wants` link for new accounts; the package's user migration `004-ionix-link` (installed to `/usr/share/ionix/migrations/user/`, run once per user by `ionix-migrate`) enables it for existing ones.
 
 ## Work split
 

@@ -77,6 +77,12 @@ abstract class LinkPlatform {
 
   /// Read the phone's clipboard text ("" if none). Only works while the app is in the foreground on Android 10+.
   Future<String> getClipboard();
+
+  // Window
+
+  /// Keep the screen from timing out while the app's window is showing (it applies only to the app's own window, so
+  /// leaving the app lets the phone sleep as usual).
+  Future<void> setKeepScreenOn(bool on);
 }
 
 /// The phone's name and model as the platform reports them.

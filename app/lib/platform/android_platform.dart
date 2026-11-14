@@ -196,4 +196,16 @@ class AndroidPlatform extends LinkPlatform {
 
   @override
   Future<String> getClipboard() async => (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? "";
+
+  // MainActivity.kt answers this channel by setting or clearing FLAG_KEEP_SCREEN_ON on its window.
+  static const MethodChannel _window = MethodChannel("dev.ionnet.ionix_link/window");
+
+  @override
+  Future<void> setKeepScreenOn(bool on) async {
+    try {
+      await _window.invokeMethod<void>("keepScreenOn", on);
+    } on PlatformException catch (error) {
+      debugPrint("ionix-link: could not ${on ? "keep the screen on" : "let the screen sleep"}: ${error.message}");
+    }
+  }
 }

@@ -49,7 +49,7 @@ with open(CERT) as f:
 FP = FP_RAW.hex()
 HOST_ID = secrets.token_hex(16)
 HOST_NAME = "fakeix"
-DAEMON_CAPS = {"notifications": ["dismiss"], "media": ["players", "volume"], "commands": [], "clipboard": [],
+DAEMON_CAPS = {"notifications": ["dismiss"], "media": ["players", "volume", "art"], "commands": [], "clipboard": [],
                "input": ["pointer", "keyboard"], "screen": ["jpeg"], "status": ["volume"], "theme": ["wallpaper"]}
 WALLPAPER = bytes.fromhex("ffd8ffe0") + b"fake wallpaper" * 8000 + bytes.fromhex("ffd9")  # > 64 KiB on purpose
 devices = {}  # deviceId -> key bytes
@@ -184,7 +184,8 @@ class Conn:
         self.send("media.players", {"players": [{"name": "spotify", "identity": "Spotify", "status": "playing",
                                                  "title": "Song", "artist": "A", "album": "B", "length": 200000,
                                                  "position": 1000, "positionTime": int(time.time() * 1000),
-                                                 "canSeek": True}], "active": "spotify"})
+                                                 "canSeek": True, "artUrl": "file:///fake/cover.png"}],
+                                    "active": "spotify"})
         self.send("media.volume", {"volume": 0.5, "muted": False})
       if "theme" in names: self.send("theme.changed", theme_obj())
       return
@@ -267,6 +268,10 @@ class Conn:
       t = theme_obj()
       self.send("theme.wallpaper", {"format": "jpeg", "w": 1080, "h": 608, "wallpaper": t["wallpaper"]}, re=mid,
                 data=WALLPAPER + theme["accent"].encode())
+    elif typ == "media.art":
+      stats["art"] = stats.get("art", 0) + 1
+      self.send("media.art", {"format": "jpeg", "w": 512, "h": 512, "artUrl": "file:///fake/cover.png"}, re=mid,
+                data=bytes.fromhex("ffd8ffe0") + b"fake cover" + bytes.fromhex("ffd9"))
     elif typ == "debug.stats":
       reply(stats)
     elif typ == "debug.theme":
