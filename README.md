@@ -26,7 +26,7 @@ Your phone, on speaking terms with your Ionix desktop. Pair once, then read the 
 On the desktop (Ionix ships the `ionix-link-git` package; on other Arch systems it is on the AUR):
 
 ```bash
-systemctl --user enable --now ionix-link.service   # not needed on Ionix, where it is already on
+systemctl --user enable --now ionix-link.service   # on Ionix, new accounts have it on already
 ionix-link pair
 ```
 
