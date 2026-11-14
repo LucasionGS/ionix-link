@@ -27,6 +27,7 @@ app/                           Flutter app (android + linux), package ionix_link
                                link_status.dart, discovery.dart (UDP), pairing.dart (QR and code flows)
     store/link_store.dart      link.json + flutter_secure_storage keys
     plugins/                   plugin_client.dart (base) + one <name>_client.dart per plugin, models inside
+                               (share_client.dart: text, and chunked file uploads with progress/cancel)
   lib/platform/                Layer 3: OS glue behind `LinkPlatform`
     link_platform.dart         Interface + PlatformDevice
     android_platform.dart      The real one
@@ -41,6 +42,7 @@ app/                           Flutter app (android + linux), package ionix_link
     plugin_pages.dart          Registry of dashboard tiles → pages
     pages/                     home, media, commands, clipboard, input, screen, notifications, settings
     pages/pair/                pair_page (start + nearby), qr_scan_page, code_confirm_page
+    pages/share/               share_session (what a share does, no widgets), share_sheet (the "Send to <desktop>" sheet)
     widgets/                   adaptive_scaffold (one pane / two panes on the hinge / tabletop), backdrop,
                                ion_card and the other shared pieces of the glass look, touchpad
   assets/fonts/                JetBrains Mono Nerd Font (OFL), the shell's font
@@ -110,7 +112,7 @@ Every protocol change lands in `PROTOCOL.md` in the same commit. A breaking one 
 
 `exec` as a list is argv; as a string it runs under `sh -c`. `timeout` defaults to 10 s. A user entry with a built-in's id replaces it; `"hidden": true` removes it.
 
-Environment overrides (daemon): `IONIX_LINK_PORT`, `IONIX_LINK_BIND`, `IONIX_LINK_NAME`, `IONIX_LINK_DISCOVERY`, `IONIX_LINK_DATA_DIR`, `IONIX_LINK_STATE_DIR`, `IONIX_LINK_CONFIG_DIR`, `IONIX_LINK_SOCKET`, `IONIX_LINK_THEME_DIR`, `IONIX_LINK_THEME_NAME_FILE`, `IONIX_LINK_POWER_SUPPLY_DIR`, `IONIX_LINK_DEBUG`, `IONIX_LINK_BIN_<TOOL>`.
+Environment overrides (daemon): `IONIX_LINK_PORT`, `IONIX_LINK_BIND`, `IONIX_LINK_NAME`, `IONIX_LINK_DISCOVERY`, `IONIX_LINK_DATA_DIR`, `IONIX_LINK_STATE_DIR`, `IONIX_LINK_CONFIG_DIR`, `IONIX_LINK_DOWNLOAD_DIR` (where shared files land), `IONIX_LINK_SOCKET`, `IONIX_LINK_THEME_DIR`, `IONIX_LINK_THEME_NAME_FILE`, `IONIX_LINK_POWER_SUPPLY_DIR`, `IONIX_LINK_DEBUG`, `IONIX_LINK_BIN_<TOOL>`.
 
 ## Pub packages (main session adds them; `flutter pub add <name>`)
 

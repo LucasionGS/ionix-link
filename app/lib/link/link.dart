@@ -19,6 +19,7 @@ export "plugins/media_client.dart";
 export "plugins/notifications_client.dart";
 export "plugins/plugin_client.dart" show PluginClient;
 export "plugins/screen_client.dart";
+export "plugins/share_client.dart";
 export "plugins/status_client.dart";
 export "plugins/theme_client.dart";
 export "protocol/constants.dart" show LinkProtocol, LinkPlugins;

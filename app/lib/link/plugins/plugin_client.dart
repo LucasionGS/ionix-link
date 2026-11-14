@@ -113,16 +113,16 @@ abstract class PluginClient {
   /// Send a request on the attached connection and return the reply body.
   /// @throws LinkPluginUnavailableException when not available; otherwise as [LinkConnection.request].
   @protected
-  Future<Map<String, dynamic>> request(String type, [Map<String, dynamic> body = const {}, Duration? timeout]) async {
-    return (await requestMessage(type, body, timeout)).body;
+  Future<Map<String, dynamic>> request(String type, [Map<String, dynamic> body = const {}, Duration? timeout, Uint8List? data]) async {
+    return (await requestMessage(type, body, timeout, data)).body;
   }
 
   /// Like [request], but returns the whole reply, for replies that carry binary data.
   @protected
-  Future<LinkMessage> requestMessage(String type, [Map<String, dynamic> body = const {}, Duration? timeout]) {
+  Future<LinkMessage> requestMessage(String type, [Map<String, dynamic> body = const {}, Duration? timeout, Uint8List? data]) {
     final connection = _connection;
     if (connection == null || !isAvailable) return Future.error(LinkPluginUnavailableException(name));
-    return connection.request(type, body, timeout);
+    return connection.request(type, body, timeout, data);
   }
 
   /// Send a push on the attached connection.

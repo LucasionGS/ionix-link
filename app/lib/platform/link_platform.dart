@@ -83,6 +83,66 @@ abstract class LinkPlatform {
   /// Keep the screen from timing out while the app's window is showing (it applies only to the app's own window, so
   /// leaving the app lets the phone sleep as usual).
   Future<void> setKeepScreenOn(bool on);
+
+  // Sharing into the app
+
+  /// What other apps share to this one (Android's share sheet) while the app is running.
+  Stream<IncomingShare> get incomingShares;
+
+  /// The share that started the app, once; null if it was started normally.
+  Future<IncomingShare?> takeLaunchShare();
+
+  /// Make a shared file readable by path: the platform copies it into the app's cache (and hashes it on the way).
+  /// @throws PlatformException when the sending app no longer provides the file.
+  Future<StagedFile> stageSharedFile(SharedFile file);
+
+  /// Delete every staged copy.
+  Future<void> clearStagedFiles();
+}
+
+/// Text or files another app handed to Ionix Link to send to the desktop.
+class IncomingShare {
+  const IncomingShare({this.text, this.subject, this.files = const []});
+
+  /// Shared text or link; null when files were shared.
+  final String? text;
+
+  /// The sharing app's subject line (a page title from a browser), if any.
+  final String? subject;
+
+  /// Shared files, in the order the app gave them.
+  final List<SharedFile> files;
+
+  bool get isEmpty => (text == null || text!.trim().isEmpty) && files.isEmpty;
+}
+
+/// One file in an [IncomingShare], not yet copied.
+class SharedFile {
+  const SharedFile({required this.uri, required this.name, required this.size, this.mime});
+
+  /// `content://` (or `file://`) address the platform reads it from.
+  final String uri;
+
+  /// Display name the sharing app gave it.
+  final String name;
+
+  /// Bytes, or -1 when the app did not say.
+  final int size;
+  final String? mime;
+}
+
+/// A shared file copied to a path this app can read.
+class StagedFile {
+  const StagedFile({required this.path, required this.size, this.sha256});
+
+  /// Local path.
+  final String path;
+
+  /// Real size in bytes.
+  final int size;
+
+  /// Hex SHA-256 when the platform computed it while copying, else null.
+  final String? sha256;
 }
 
 /// The phone's name and model as the platform reports them.

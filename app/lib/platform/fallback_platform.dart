@@ -73,4 +73,25 @@ class FallbackPlatform extends LinkPlatform {
 
   @override
   Future<void> setKeepScreenOn(bool on) async {}
+
+  final StreamController<IncomingShare> _shares = StreamController.broadcast();
+
+  /// Pretend another app shared [share] (Linux has no share sheet; the headless checks use this).
+  void debugShare(IncomingShare share) => _shares.add(share);
+
+  @override
+  Stream<IncomingShare> get incomingShares => _shares.stream;
+
+  @override
+  Future<IncomingShare?> takeLaunchShare() async => null;
+
+  /// Files are read where they are: a `file://` uri or a plain path, with no copy and no hash.
+  @override
+  Future<StagedFile> stageSharedFile(SharedFile file) async {
+    final path = file.uri.startsWith("file://") ? Uri.parse(file.uri).toFilePath() : file.uri;
+    return StagedFile(path: path, size: await File(path).length());
+  }
+
+  @override
+  Future<void> clearStagedFiles() async {}
 }

@@ -50,12 +50,15 @@ FP = FP_RAW.hex()
 HOST_ID = secrets.token_hex(16)
 HOST_NAME = "fakeix"
 DAEMON_CAPS = {"notifications": ["dismiss"], "media": ["players", "volume", "art"], "commands": [], "clipboard": [],
-               "input": ["pointer", "keyboard"], "screen": ["jpeg"], "status": ["volume"], "theme": ["wallpaper"]}
+               "input": ["pointer", "keyboard"], "screen": ["jpeg"], "status": ["volume"], "theme": ["wallpaper"],
+               "share": ["text", "files"]}
 WALLPAPER = bytes.fromhex("ffd8ffe0") + b"fake wallpaper" * 8000 + bytes.fromhex("ffd9")  # > 64 KiB on purpose
 devices = {}  # deviceId -> key bytes
 token = {"value": secrets.token_hex(16)}
 stats = {"moves": 0, "dx": 0.0, "dy": 0.0, "scrolls": 0, "buttons": [], "acks": [], "clipboard": None,
-         "battery": None, "ring": None, "connections": 0, "hellos": 0, "queries": []}
+         "battery": None, "ring": None, "connections": 0, "hellos": 0, "queries": [],
+         "share": {"texts": [], "files": [], "cancelled": 0}}
+uploads = {}  # share transfer id -> {name, size, got, hash}
 theme = {"accent": "#9b59b6"}
 live = {}  # deviceId -> Conn
 
@@ -253,6 +256,35 @@ class Conn:
       reply({"text": "from desktop"})
     elif typ == "clipboard.push":
       stats["clipboard"] = body["text"]; reply({"ok": True})
+    elif typ == "share.text":
+      text = body["text"].strip()
+      opened = text.startswith("http") and " " not in text
+      stats["share"]["texts"].append({"text": body["text"], "subject": body.get("subject"), "opened": opened})
+      reply({"action": "opened" if opened else "copied"})
+    elif typ == "share.begin":
+      tid = secrets.token_hex(8)
+      uploads[tid] = {"name": body["name"], "size": body["size"], "got": 0, "hash": hashlib.sha256()}
+      reply({"transfer": tid})
+    elif typ == "share.chunk":
+      up = uploads.get(body["transfer"])
+      if up is None: self.error("not_found", "No such transfer.", re=mid)
+      elif body["offset"] != up["got"]:
+        uploads.pop(body["transfer"]); self.error("invalid_argument", "Wrong offset.", re=mid)
+      else:
+        up["got"] += len(data); up["hash"].update(data)
+        await asyncio.sleep(0.05)  # a link that is not instant, so a cancel can land between chunks
+        reply({"received": up["got"]})
+    elif typ == "share.end":
+      up = uploads.pop(body["transfer"], None)
+      if up is None: self.error("not_found", "No such transfer.", re=mid)
+      else:
+        ok = up["got"] == up["size"] and up["hash"].hexdigest() == body["sha256"]
+        stats["share"]["files"].append({"name": up["name"], "size": up["got"], "ok": ok, "sha256": up["hash"].hexdigest()})
+        if ok: reply({"path": "/home/fake/Downloads/" + up["name"], "name": up["name"]})
+        else: self.error("failed", "Damaged.", re=mid)
+    elif typ == "share.cancel":
+      if uploads.pop(body["transfer"], None) is not None: stats["share"]["cancelled"] += 1
+      reply({})
     elif typ == "screen.outputs":
       reply({"outputs": [{"name": "HEADLESS-1", "description": "Fake", "x": 0, "y": 0, "width": 1920, "height": 1080,
                           "scale": 1.0, "focused": True}]})

@@ -19,7 +19,7 @@ so the phone never shows a tile that cannot work. Adding a plugin means one
 
 Nothing here talks to a desktop service through a library. It shells out:
 busctl (notifications), playerctl, wpctl/pactl (media), wl-copy/wl-paste,
-wtype, grim, hyprctl or wlr-randr, notify-send, qrencode, awww, magick or
+wtype, grim, hyprctl or wlr-randr, notify-send, xdg-open, qrencode, awww, magick or
 ffmpeg, and openssl. The one exception is the pointer: a small Wayland client
 speaking zwlr_virtual_pointer_v1 over the compositor socket, because no CLI
 tool moves a pointer relatively at touchpad rates without a process per event.
@@ -39,6 +39,7 @@ own lock so a screen frame and a reply never interleave.
 
 import asyncio
 import copy
+import errno
 import glob
 import hashlib
 import hmac
@@ -111,6 +112,14 @@ ART_FETCH_MAX = 16 * 1024 * 1024   # bytes of cover art read from a file or URL 
 ART_FETCH_TIMEOUT = 5              # s per socket operation of an http(s) cover download ...
 ART_FETCH_TOTAL = 15               # ... and for the whole download
 ART_CACHE = 16                     # scaled covers kept, by (artUrl, maxSize)
+SHARE_MAX_SIZE = 4 * 1024 * 1024 * 1024   # bytes of one shared file
+SHARE_CHUNK = 1024 * 1024          # bytes of data in one share.chunk
+SHARE_DISK_MARGIN = 64 * 1024 * 1024      # bytes that must stay free on the download disk after a file
+SHARE_DISK_CHECK = 64 * 1024 * 1024       # bytes written to one file between free space checks
+SHARE_IDLE = 60                    # s without a chunk before a transfer is dropped
+SHARE_WATCH = 5                    # s between checks for that
+SHARE_NAME_MAX = 200               # bytes of a saved file name (the part file adds about 20 of the filesystem's 255)
+SHARE_NOTIFY_TTL = 30              # s a "file received" notification keeps its Open / Show in folder buttons
 
 # Error codes (§7). Fatal ones close the connection after the error frame.
 ERR_BAD_FRAME = "bad_frame"
@@ -182,7 +191,7 @@ DEFAULT_CONFIG = {
     # Per-plugin switch; a plugin set false is never offered.
     "plugins": {
         "notifications": True, "media": True, "commands": True, "clipboard": True,
-        "input": True, "screen": True, "status": True, "theme": True,
+        "input": True, "screen": True, "status": True, "theme": True, "share": True,
     },
     "notifications": {
         # app_name values never forwarded (case-insensitive).
@@ -205,7 +214,7 @@ VIRTUAL_IFACES = ("docker", "br-", "veth", "virbr", "vnet", "vmnet", "cni", "fla
 # Every path and the port can be moved by environment, so the whole daemon can
 # run against a scratch dir:
 #   IONIX_LINK_PORT, IONIX_LINK_BIND, IONIX_LINK_NAME, IONIX_LINK_DISCOVERY (0/1),
-#   IONIX_LINK_DATA_DIR, IONIX_LINK_STATE_DIR, IONIX_LINK_CONFIG_DIR, IONIX_LINK_SOCKET,
+#   IONIX_LINK_DATA_DIR, IONIX_LINK_STATE_DIR, IONIX_LINK_CONFIG_DIR, IONIX_LINK_DOWNLOAD_DIR, IONIX_LINK_SOCKET,
 #   IONIX_LINK_THEME_DIR, IONIX_LINK_THEME_NAME_FILE, IONIX_LINK_POWER_SUPPLY_DIR,
 #   IONIX_LINK_DEBUG (1 = verbose log), and IONIX_LINK_BIN_<TOOL> for any tool
 #   (IONIX_LINK_BIN_GRIM=/path/to/fake-grim), resolved by tool().
@@ -2540,6 +2549,522 @@ class ClipboardPlugin(Plugin):
             raise LinkError(CERR_NOT_CONNECTED, "The phone disconnected.")
 
 
+# ── share (§8.9) ───────────────────────────────────────────────────────────
+
+_SAFE_NAME_STRIP = re.compile("[\x00-\x1f\x7f-\x9f‎‏‪-‮⁦-⁩/\\\\]")
+
+
+def safe_filename(name):
+    """A file name from the phone, made safe to create in the download directory: basename only (both separators
+    count), no control or bidi characters, no leading dots (never hidden, never `..`), no trailing dots or spaces,
+    at most SHARE_NAME_MAX bytes with the extension kept, and never empty."""
+    if not isinstance(name, str):
+        name = ""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = _SAFE_NAME_STRIP.sub("", name).strip().lstrip(".").rstrip(". ")
+    stem, ext = os.path.splitext(name)
+    if len(ext.encode("utf-8")) > 24:
+        stem, ext = name, ""
+    room = max(SHARE_NAME_MAX - len(ext.encode("utf-8")), 1)
+    stem = stem.encode("utf-8")[:room].decode("utf-8", "ignore").rstrip(". ")
+    return (stem + ext) if stem else (("file" + ext) if ext else "file")
+
+
+def single_web_url(text):
+    """`text` trimmed if it is nothing but one http(s) URL, else None."""
+    s = text.strip()
+    if not s or len(s) > 8192 or re.search(r"\s", s) or _UNSAFE_CHARS.search(s):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(s)
+        host = parts.hostname
+    except ValueError:
+        return None
+    return s if parts.scheme.lower() in ("http", "https") and host else None
+
+
+_PART_FILE = re.compile(r"\..+\.ionix-link-part")    # what _open_part creates, matched whole
+
+
+class _Upload:
+    """One file being received on one connection."""
+
+    def __init__(self, conn, token, name, size, mime, part_path, fd):
+        self.conn = conn
+        self.token = token
+        self.name = name           # sanitised, before collision handling
+        self.size = size
+        self.mime = mime
+        self.part_path = part_path
+        self.fd = fd
+        self.received = 0
+        self.digest = hashlib.sha256()
+        self.lock = asyncio.Lock() # one request at a time; whoever holds it owns the fd and the part file
+        self.touched = time.monotonic()
+        self.published = 0.0       # monotonic time of the last state.json progress write
+        self.unchecked = 0         # bytes written since free space was last checked
+        self.cancelled = False     # a cancel, disconnect or timeout asked for it to go; the lock holder acts on it
+        self.closed = False        # fd closed and the part file deleted or linked into place: nothing left to clean up
+        self.final = None          # where it was saved, once linked into place
+
+    def info(self):
+        return {"id": self.token, "name": self.name, "size": self.size, "received": self.received}
+
+
+class SharePlugin(Plugin):
+    """§8.9. Phone → desktop sharing. `share.text` opens a lone link or copies the text; files arrive as
+    begin / chunk… / end into `.<name>.ionix-link-part` in the download directory, one request in flight, then are
+    verified (size, SHA-256) and linked into place under a free name. Nothing is ever overwritten or followed
+    through a symlink. A disconnect or SHARE_IDLE s of silence deletes the part file."""
+
+    name = "share"
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.download_dir = None
+        self.files_ok = False
+        self.uploads = {}          # conn → _Upload (one at a time per connection)
+        self.notify_tasks = set()  # "file received" notifications waiting for a button; outlive the connection
+
+    def available(self):
+        # Before the first prepare() the download directory is unknown, and negotiation prepares only plugins that
+        # are available; so "no caps yet" must not hide the plugin, only "no caps once looked at".
+        return super().available() and (self.download_dir is None or bool(self.caps()))
+
+    def caps(self):
+        caps = []
+        if tool("wl-copy") or tool("xdg-open"):
+            caps.append("text")
+        if self.files_ok:
+            caps.append("files")
+        return caps
+
+    async def prepare(self):
+        """Resolve the download directory (`IONIX_LINK_DOWNLOAD_DIR`, else `xdg-user-dir DOWNLOAD`, else
+        ~/Downloads) and whether it can take files: it exists and is writable, or can be created in its parent."""
+        path = os.environ.get("IONIX_LINK_DOWNLOAD_DIR", "")
+        if not path:
+            xdg = tool("xdg-user-dir")
+            if xdg:
+                try:
+                    rc, out, _ = await run_tool([xdg, "DOWNLOAD"], timeout=3)
+                except LinkError:
+                    rc, out = 1, b""
+                path = out.decode("utf-8", "replace").strip() if rc == 0 else ""
+        home = os.path.expanduser("~")
+        if not path or not os.path.isabs(path) or os.path.normpath(path) == os.path.normpath(home):
+            # xdg-user-dir answers $HOME when the user has no Downloads directory configured.
+            path = os.path.join(home, "Downloads")
+        self.download_dir = path
+        probe = path
+        while not os.path.isdir(probe) and os.path.dirname(probe) != probe:
+            probe = os.path.dirname(probe)
+        self.files_ok = os.path.isdir(probe) and os.access(probe, os.W_OK | os.X_OK)
+        if self.files_ok and os.path.isdir(path):
+            await asyncio.to_thread(self._sweep, path)
+
+    def transfers_of(self, conn):
+        """The transfer state.json shows for `conn`: a list of {id, name, size, received}, empty when idle."""
+        up = self.uploads.get(conn)
+        return [up.info()] if up is not None else []
+
+    async def shutdown(self):
+        for task in list(self.notify_tasks):
+            task.cancel()
+        await super().shutdown()
+
+    async def on_close(self, conn):
+        up = self.uploads.get(conn)
+        if up is not None:
+            await self._drop(up)
+
+    # ── requests
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        b = msg["body"]
+        if t == "share.text":
+            return await self._text(conn, b)
+        if t == "share.begin":
+            return await self._begin(conn, b)
+        if t == "share.chunk":
+            return await self._chunk(conn, b, data)
+        if t == "share.end":
+            return await self._end(conn, b)
+        if t == "share.cancel":
+            up = self._find(conn, b.get("transfer"), must_exist=False)
+            if up is not None:
+                await self._drop(up)
+            return {}
+        return await super().handle(conn, msg, data)
+
+    def _who(self, conn):
+        return conn.device["name"] if conn.device else "your phone"
+
+    async def _text(self, conn, b):
+        if "text" not in self.caps():
+            raise LinkError(ERR_PLUGIN_UNAVAILABLE, "The desktop can neither open links nor copy text (wl-copy and xdg-open are missing).")
+        text, subject = b.get("text"), b.get("subject")
+        if not isinstance(text, str) or not text.strip():
+            raise LinkError(ERR_INVALID_ARGUMENT, "share.text needs a non-empty \"text\".")
+        if len(text.encode("utf-8")) > MAX_TEXT:
+            raise LinkError(ERR_INVALID_ARGUMENT, f"The shared text is over {MAX_TEXT // 1024} KiB.")
+        subject = clean_text(subject, 200) if isinstance(subject, str) else ""
+        who = self._who(conn)
+        url = single_web_url(text)
+        xdg_open = tool("xdg-open")
+        if url is not None and xdg_open:
+            if await self._open(xdg_open, url):
+                await self._notify(f"Link from {who}", subject or url)
+                return {"action": "opened"}
+            log(f"xdg-open could not open {url}; copying it instead.")
+        wl_copy = tool("wl-copy")
+        if not wl_copy:
+            raise LinkError(ERR_FAILED, "xdg-open failed and wl-copy is not installed, so the shared text had nowhere to go.")
+        # wl-copy forks a child that serves the clipboard and keeps any pipe it was given, so no capture.
+        rc, _, _ = await run_tool([wl_copy, "--type", "text/plain"], stdin=text.encode("utf-8"), timeout=5, capture=False)
+        if rc != 0:
+            raise LinkError(ERR_FAILED, "wl-copy failed; is a Wayland session running?", details={"exitCode": rc})
+        first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        await self._notify(f"Text from {who} copied", clean_text(first, 200) or subject)
+        return {"action": "copied"}
+
+    async def _open(self, xdg_open, target):
+        """Hand `target` to xdg-open, in a scope of its own when systemd-run exists so the program it starts does not
+        die with this service. True if it started (a browser that stays attached for a while counts)."""
+        argv = [xdg_open, target]
+        systemd_run = tool("systemd-run")
+        if systemd_run:
+            argv = [systemd_run, "--user", "--scope", "--quiet", "--"] + argv
+        try:
+            proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+                                                        stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            log(f"Could not run xdg-open: {e.strerror or e}.")
+            return False
+        try:
+            return await asyncio.wait_for(asyncio.shield(proc.wait()), 5) == 0
+        except TimeoutError:
+            asyncio.get_running_loop().create_task(proc.wait())     # reaped later; it is still starting its program
+            return True
+
+    async def _notify(self, summary, body):
+        ns = tool("notify-send")
+        if not ns:
+            return
+        try:
+            await run_tool([ns, f"--app-name={APP_NAME}", "--", summary, markup_escape(body)], timeout=5)
+        except LinkError as e:
+            log(f"share: could not notify: {e.message}")
+
+    # ── files
+
+    def _find(self, conn, token, must_exist=True):
+        up = self.uploads.get(conn)
+        if up is None or up.token != token:
+            if must_exist:
+                raise LinkError(ERR_NOT_FOUND, "No such transfer: it was cancelled, timed out or never started.")
+            return None
+        return up
+
+    def _forget(self, up):
+        if self.uploads.get(up.conn) is up:
+            del self.uploads[up.conn]
+            self.daemon.state.changed()
+
+    def _discard(self, up):
+        """Close `up`'s file and delete its part file. Only ever called holding `up.lock`, so no write, fsync or link is
+        using that fd or path in a worker thread; anyone else goes through _drop."""
+        if up.closed:
+            return
+        up.closed = True
+        self._forget(up)
+        fd, up.fd = up.fd, -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(up.part_path)
+        except OSError:
+            pass
+
+    async def _drop(self, up):
+        """Cancel `up` from outside a request on it (share.cancel, a disconnect, the idle timeout): mark it, then clean
+        up once the request holding its lock is done. A file that request has linked into place by then stays saved,
+        and the request reports success: the cancel came too late."""
+        up.cancelled = True
+        async with up.lock:
+            self._discard(up)
+
+    @staticmethod
+    async def _in_thread(fn, *args):
+        """`asyncio.to_thread`, except that a cancelled caller still waits for `fn` to return before it sees the
+        CancelledError: the caller holds the upload's lock and must not let it go while `fn` still uses the fd."""
+        fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+        cancelled = False
+        while not fut.done():
+            try:
+                await asyncio.wait({fut})
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            fut.exception()        # retrieved, so a failure here is not logged as unhandled
+            raise asyncio.CancelledError
+        return fut.result()
+
+    def _committed(self):
+        """Bytes the open transfers still have to write."""
+        return sum(u.size - u.received for u in self.uploads.values() if not u.closed)
+
+    def _sweep(self, directory):
+        """Delete part files a killed daemon left behind (§8.9): exactly `.<name>.ionix-link-part` or
+        `.<name>.<n>.ionix-link-part`, a regular file of this user's, untouched for SHARE_IDLE s and not an open
+        transfer's; nothing else in the directory is touched."""
+        live = {u.part_path for u in self.uploads.values()}
+        cutoff = time.time() - SHARE_IDLE
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            return
+        for entry in entries:
+            if not _PART_FILE.fullmatch(entry.name) or entry.path in live:
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and st.st_mtime < cutoff:
+                    os.unlink(entry.path)
+                    log(f"share: deleted {entry.name}, left over from a transfer that never finished.")
+            except OSError:
+                pass
+
+    def _open_part(self, directory, name):
+        """Create the part file exclusively (never through a symlink); returns (path, fd)."""
+        for n in range(1000):
+            path = os.path.join(directory, f".{name}.ionix-link-part" if n == 0 else f".{name}.{n}.ionix-link-part")
+            try:
+                return path, os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o666)
+            except FileExistsError:
+                continue
+        raise OSError(errno.EEXIST, "too many part files")
+
+    async def _begin(self, conn, b):
+        if "files" not in self.caps():
+            raise LinkError(ERR_PLUGIN_UNAVAILABLE, "The desktop's download folder is not writable, so it cannot take files.")
+        name, size, mime = b.get("name"), b.get("size"), b.get("mime")
+        if not isinstance(name, str) or not name.strip():
+            raise LinkError(ERR_INVALID_ARGUMENT, "share.begin needs a file \"name\".")
+        if not is_int(size) or size < 0:
+            raise LinkError(ERR_INVALID_ARGUMENT, "share.begin needs \"size\" in bytes, 0 or more.")
+        if size > SHARE_MAX_SIZE:
+            raise LinkError(ERR_INVALID_ARGUMENT, f"Files over {SHARE_MAX_SIZE // 2**30} GiB cannot be shared.")
+        if conn in self.uploads:
+            raise LinkError(ERR_BUSY, "Another file is still being received on this connection; wait for it or cancel it.")
+        directory = self.download_dir
+        try:
+            os.makedirs(directory, exist_ok=True)
+            free = shutil.disk_usage(directory).free
+        except OSError as e:
+            raise LinkError(ERR_FAILED, f"The download folder {directory} is not usable: {e.strerror or e}.")
+        committed = self._committed()
+        if free < size + committed + SHARE_DISK_MARGIN:
+            raise LinkError(ERR_FAILED, f"Not enough free space in {directory} for {size // 2**20} MiB"
+                            + (f" (other transfers still need {committed // 2**20} MiB)." if committed else "."),
+                            details={"free": free})
+        clean = safe_filename(name)
+        try:
+            part_path, fd = await asyncio.to_thread(self._open_part, directory, clean)
+        except OSError as e:
+            raise LinkError(ERR_FAILED, f"Could not create a file in {directory}: {e.strerror or e}.")
+        token = secrets.token_hex(8)
+        up = _Upload(conn, token, clean, size, mime if isinstance(mime, str) else None, part_path, fd)
+        self.uploads[conn] = up
+        conn.spawn(self._watch(up))
+        self.daemon.state.changed()
+        log(f"share: receiving {clean} ({size} bytes) from {conn.label()}.", debug=True)
+        return {"transfer": token}
+
+    async def _watch(self, up):
+        """Drop a transfer the phone walked away from without closing the socket. A request still being worked on
+        (a slow write or fsync) is the desktop's delay, not the phone's silence."""
+        while not up.closed:
+            await asyncio.sleep(SHARE_WATCH)
+            if not up.closed and not up.lock.locked() and time.monotonic() - up.touched > SHARE_IDLE:
+                log(f"share: {up.name} from {up.conn.label()} timed out.")
+                await self._drop(up)
+
+    async def _chunk(self, conn, b, data):
+        up = self._find(conn, b.get("transfer"))
+        offset = b.get("offset")
+        if not is_int(offset) or not data:
+            await self._drop(up)
+            raise LinkError(ERR_INVALID_ARGUMENT, "share.chunk needs \"offset\" and binary data; the transfer was dropped.")
+        async with up.lock:
+            if up.closed or up.cancelled:
+                self._discard(up)
+                raise LinkError(ERR_NOT_FOUND, "The transfer was cancelled.")
+            up.touched = time.monotonic()
+            if len(data) > SHARE_CHUNK or offset != up.received or up.received + len(data) > up.size:
+                self._discard(up)
+                raise LinkError(ERR_INVALID_ARGUMENT, f"Chunk at offset {offset} does not follow the {up.received} bytes received "
+                                f"(or is over {SHARE_CHUNK // 1024} KiB, or past the announced size); the transfer was dropped.")
+            up.unchecked += len(data)
+            if up.unchecked >= SHARE_DISK_CHECK:
+                # Something else may be filling the disk; stop while the margin still holds rather than at ENOSPC.
+                up.unchecked = 0
+                need = self._committed() + SHARE_DISK_MARGIN
+                try:
+                    free = await self._in_thread(lambda: shutil.disk_usage(os.path.dirname(up.part_path)).free)
+                except OSError:
+                    free = None        # the write below reports whatever is wrong with the disk
+                if free is not None and free < need:
+                    self._discard(up)
+                    raise LinkError(ERR_FAILED, f"The download disk is filling up ({free // 2**20} MiB free, {need // 2**20} MiB "
+                                    f"needed); {up.name} was deleted.", details={"free": free})
+            try:
+                await self._in_thread(self._write, up, data)
+            except OSError as e:
+                self._discard(up)
+                raise LinkError(ERR_FAILED, f"Writing {up.name} failed: {e.strerror or e}.")
+            up.received += len(data)
+            up.touched = time.monotonic()
+            if up.touched - up.published > 1:
+                up.published = up.touched
+                self.daemon.state.changed()
+            return {"received": up.received}
+
+    @staticmethod
+    def _write(up, data):
+        view = memoryview(data)
+        while view:
+            view = view[os.write(up.fd, view):]
+        up.digest.update(data)
+
+    async def _end(self, conn, b):
+        up = self._find(conn, b.get("transfer"))
+        digest = b.get("sha256")
+        if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+            await self._drop(up)
+            raise LinkError(ERR_INVALID_ARGUMENT, "share.end needs \"sha256\", 64 hex characters; the transfer was dropped.")
+        async with up.lock:
+            if up.closed or up.cancelled:
+                self._discard(up)
+                raise LinkError(ERR_NOT_FOUND, "The transfer was cancelled.")
+            up.touched = time.monotonic()
+            if up.received != up.size:
+                got = up.received
+                self._discard(up)
+                raise LinkError(ERR_INVALID_ARGUMENT, f"The file ended after {got} of {up.size} bytes; the transfer was dropped.")
+            if up.digest.hexdigest() != digest.lower():
+                self._discard(up)
+                raise LinkError(ERR_FAILED, f"{up.name} arrived damaged (its SHA-256 does not match); it was deleted.")
+            try:
+                await self._in_thread(self._finish, up)
+            except OSError as e:
+                if up.final is None:
+                    self._discard(up)
+                    raise LinkError(ERR_FAILED, f"Saving {up.name} failed: {e.strerror or e}.")
+                log(f"share: saved {up.final}, but could not tidy up after it: {e.strerror or e}.")
+            finally:
+                # Also when the connection went while saving: once linked, the file is the user's and stays.
+                if up.final is not None and not up.closed:
+                    up.closed = True
+                    self._forget(up)
+                    log(f"share: saved {up.final} from {conn.label()}.")
+                    task = asyncio.create_task(self._announce(up.final, self._who(conn)))
+                    self.notify_tasks.add(task)
+                    task.add_done_callback(self.notify_tasks.discard)
+        return {"path": up.final, "name": os.path.basename(up.final)}
+
+    def _finish(self, up):
+        """fsync, then give the part file its final name without ever replacing anything: a hard link fails with
+        EEXIST on a taken name (dangling symlinks included), and where links are unsupported (FAT) an exclusively
+        created placeholder is renamed over instead. Sets `up.final` the moment the file is in place. Runs in a
+        worker thread for the holder of `up.lock`."""
+        os.fsync(up.fd)
+        fd, up.fd = up.fd, -1
+        os.close(fd)
+        directory = os.path.dirname(up.part_path)
+        stem, ext = os.path.splitext(up.name)
+        n = 0
+        while True:
+            name = up.name if n == 0 else f"{stem} ({n}){ext}"
+            final = os.path.join(directory, name)
+            n += 1
+            if n > 10000:
+                raise OSError(errno.EEXIST, "no free file name")
+            try:
+                os.link(up.part_path, final, follow_symlinks=False)
+            except FileExistsError:
+                continue
+            except OSError as e:
+                if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK):
+                    raise
+                try:
+                    os.close(os.open(final, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666))
+                except FileExistsError:
+                    continue
+                os.rename(up.part_path, final)
+                up.final = final
+                return
+            up.final = final
+            os.unlink(up.part_path)
+            return
+
+    async def _announce(self, path, who):
+        """Notify "<file> from <phone>" with Open / Show in folder, and act on the button until the notification goes."""
+        ns = tool("notify-send")
+        if not ns:
+            return
+        argv = [ns, f"--app-name={APP_NAME}", f"--expire-time={SHARE_NOTIFY_TTL * 1000}", "--action=open=Open",
+                "--action=show=Show in folder", "--", f"{os.path.basename(path)} from {who}", markup_escape(f"Saved in {os.path.dirname(path)}")]
+        try:
+            proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.DEVNULL)
+        except OSError as e:
+            log(f"Could not run notify-send: {e.strerror or e}.")
+            return
+        try:
+            while True:
+                line = await asyncio.wait_for(proc.stdout.readline(), SHARE_NOTIFY_TTL + 10)
+                if not line:
+                    return
+                action = line.decode("utf-8", "replace").strip()
+                if action == "open":
+                    await self._open_path(path)
+                    return
+                if action == "show":
+                    await self._show(path)
+                    return
+        except TimeoutError:
+            pass
+        finally:
+            _kill(proc)
+            await proc.wait()
+
+    async def _open_path(self, path):
+        xdg_open = tool("xdg-open")
+        if xdg_open and not await self._open(xdg_open, path):
+            log(f"xdg-open could not open {path}.")
+
+    async def _show(self, path):
+        """Select the file in the file manager (org.freedesktop.FileManager1.ShowItems), else open its folder."""
+        busctl = tool("busctl")
+        if busctl:
+            uri = "file://" + urllib.parse.quote(path)
+            try:
+                rc, _, _ = await run_tool([busctl, "--user", "call", "org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                                           "org.freedesktop.FileManager1", "ShowItems", "ass", "1", uri, ""], timeout=5)
+                if rc == 0:
+                    return
+            except LinkError:
+                pass
+        xdg_open = tool("xdg-open")
+        if xdg_open:
+            await self._open(xdg_open, os.path.dirname(path))
+
+
 def truncate_utf8(raw, limit):
     """Decode `raw`, cut to at most `limit` bytes on a character boundary."""
     return raw[:limit].decode("utf-8", "ignore") if len(raw) > limit else raw.decode("utf-8", "replace")
@@ -3471,7 +3996,7 @@ class ThemePlugin(Plugin):
 
 # The plugin registry: order is the order of `ready.plugins`. A new plugin is one class above and one entry here.
 PLUGINS = [NotificationsPlugin, MediaPlugin, CommandsPlugin, ClipboardPlugin, InputPlugin, ScreenPlugin, StatusPlugin,
-           ThemePlugin]
+           ThemePlugin, SharePlugin]
 
 
 # ── Discovery (§4.1) ───────────────────────────────────────────────────────
@@ -3848,6 +4373,9 @@ class Daemon:
             if conn.battery is not None:
                 entry["battery"] = conn.battery
         entry["plugins"] = list(conn.plugins) if conn is not None else []
+        share = self.plugins.get("share")
+        if conn is not None and share is not None and share.transfers_of(conn):
+            entry["transfers"] = share.transfers_of(conn)
         return entry
 
     def auth_locked(self, address):

@@ -9,6 +9,8 @@ import "../../link/link.dart";
 import "../../platform/link_platform.dart";
 import "../app.dart";
 import "../pages/pair/code_confirm_page.dart";
+import "../pages/share/share_session.dart";
+import "../pages/share/share_sheet.dart";
 import "../sources.dart";
 import "../widgets/adaptive_scaffold.dart";
 import "fakes.dart";
@@ -45,7 +47,7 @@ const LinkTheme _winix = LinkTheme(
 );
 
 class _Scenario {
-  const _Scenario(this.name, this.size, {this.theme = LinkTheme.ionix, this.open, this.features = const [], this.paired = true, this.offline = false, this.code = false, this.settings = false, this.fullscreen = false, this.thenSize, this.thenFeatures = const []});
+  const _Scenario(this.name, this.size, {this.theme = LinkTheme.ionix, this.open, this.features = const [], this.paired = true, this.offline = false, this.code = false, this.settings = false, this.fullscreen = false, this.share, this.thenSize, this.thenFeatures = const []});
 
   final String name;
   final Size size;
@@ -59,6 +61,9 @@ class _Scenario {
 
   /// Enter full screen once the page is up (screen viewer only).
   final bool fullscreen;
+
+  /// Open the share sheet in this state once the app is up (`sending`, `waiting`, `done`, `failed`, `nohost`, `text`).
+  final String? share;
 
   /// Resize to this after the first picture, in the same app instance, as a fold or unfold would.
   final Size? thenSize;
@@ -109,6 +114,18 @@ final List<_Scenario> _scenarios = [
   const _Scenario("book-turned-media", _bookOpenTurned, open: LinkPlugins.media, features: _bookFoldTurned),
   const _Scenario("book-tabletop-screen", _bookOpenTurned, open: LinkPlugins.screen, features: _bookTabletop),
   const _Scenario("book-tabletop-media", _bookOpenTurned, open: LinkPlugins.media, features: _bookTabletop),
+  const _Scenario("share-phone-confirm", _phone, share: "confirm"),
+  const _Scenario("share-phone-confirm-link", _phone, share: "confirm-link"),
+  const _Scenario("share-phone-sending", _phone, share: "sending"),
+  const _Scenario("share-phone-waiting", _phone, share: "waiting"),
+  const _Scenario("share-phone-done", _phone, share: "done"),
+  const _Scenario("share-phone-failed", _phone, share: "failed"),
+  const _Scenario("share-phone-nohost", _phone, paired: false, share: "nohost"),
+  const _Scenario("share-phone-link", _phone, share: "link"),
+  _Scenario("share-phone-sending-winix", _phone, theme: _winix, share: "sending"),
+  const _Scenario("share-unfolded-sending", _unfolded, features: _hinge, share: "sending"),
+  const _Scenario("share-book-open-sending", _bookOpen, features: _bookFold, share: "sending"),
+  const _Scenario("share-book-tabletop-done", _bookOpenTurned, features: _bookTabletop, share: "done"),
   const _Scenario("fs-phone", _phone, open: LinkPlugins.screen, fullscreen: true),
   const _Scenario("fs-phone-landscape", Size(915, 412), open: LinkPlugins.screen, fullscreen: true),
   const _Scenario("fs-book-cover", _bookCover, open: LinkPlugins.screen, fullscreen: true),
@@ -117,6 +134,43 @@ final List<_Scenario> _scenarios = [
   _Scenario("fs-book-tabletop-winix", _bookOpenTurned, theme: _winix, open: LinkPlugins.screen, features: _bookTabletop, fullscreen: true),
   const _Scenario("fs-fold-switch", _bookCover, open: LinkPlugins.screen, fullscreen: true, thenSize: _bookOpen, thenFeatures: _bookFold),
 ];
+
+/// A frozen share session in the named state, for a picture of the sheet.
+ShareSession _sharePreview(String state) {
+  const photos = IncomingShare(files: [
+    SharedFile(uri: "content://media/1", name: "IMG_20261114_182233.jpg", size: 4823411, mime: "image/jpeg"),
+    SharedFile(uri: "content://media/2", name: "Holiday clip.mp4", size: 61203455, mime: "video/mp4"),
+    SharedFile(uri: "content://media/3", name: "Notes.pdf", size: 183204, mime: "application/pdf"),
+  ]);
+  ShareItem item(int at, ShareItemStatus status, {int sent = 0, String? error}) => ShareItem(photos.files[at])
+    ..status = status
+    ..sentBytes = sent
+    ..error = error;
+  const link = IncomingShare(text: "https://www.example.com/articles/a-very-long-address-that-a-browser-would-share?utm_source=share", subject: "A page worth reading");
+  switch (state) {
+    case "confirm":
+      return ShareSession.preview(photos, stage: ShareStage.confirm, items: [item(0, ShareItemStatus.queued), item(1, ShareItemStatus.queued), item(2, ShareItemStatus.queued)]);
+    case "confirm-link":
+      return ShareSession.preview(link, stage: ShareStage.confirm);
+    case "sending":
+      return ShareSession.preview(photos, stage: ShareStage.sending, items: [item(0, ShareItemStatus.done), item(1, ShareItemStatus.sending, sent: 23400000), item(2, ShareItemStatus.queued)]);
+    case "waiting":
+      return ShareSession.preview(photos, stage: ShareStage.waiting, items: [item(0, ShareItemStatus.queued), item(1, ShareItemStatus.queued), item(2, ShareItemStatus.queued)]);
+    case "done":
+      return ShareSession.preview(photos, stage: ShareStage.done, message: "Saved to Downloads on fakeix.", items: [item(0, ShareItemStatus.done), item(1, ShareItemStatus.done), item(2, ShareItemStatus.done)]);
+    case "failed":
+      return ShareSession.preview(photos, stage: ShareStage.failed, message: "Not enough free space in /home/ion/Downloads for 58 MiB.", items: [item(0, ShareItemStatus.done), item(1, ShareItemStatus.failed, error: "Not enough free space in /home/ion/Downloads for 58 MiB."), item(2, ShareItemStatus.queued)]);
+    case "nohost":
+      return ShareSession.preview(photos, stage: ShareStage.noHost, message: "No desktop is paired yet. Pair one, then share again.", items: [item(0, ShareItemStatus.queued), item(1, ShareItemStatus.queued), item(2, ShareItemStatus.queued)]);
+    default:
+      return ShareSession.preview(
+        link,
+        stage: ShareStage.done,
+        message: "Opened on fakeix.",
+        textAction: ShareAction.opened,
+      );
+  }
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -158,6 +212,7 @@ class _PreviewState extends State<_Preview> {
       UiSources.input = FakeInputSource();
       UiSources.screen = FakeScreenSource();
       UiSources.pair = FakePairSource();
+      UiSources.share = FakeShareSource(paired: scenario.paired);
       final shell = ShellController();
       if (scenario.open != null) shell.openPage(scenario.open!);
       if (scenario.settings) shell.showSection(ShellSection.settings);
@@ -173,6 +228,14 @@ class _PreviewState extends State<_Preview> {
       }
       if (scenario.code) {
         _navigator()?.push(MaterialPageRoute<void>(builder: (_) => CodeConfirmPage(host: DiscoveredHost(id: "a" * 32, name: "myeonix", address: "192.168.1.42", port: 47110, fingerprint: "b" * 64, protocol: 1, protocolMin: 1))));
+        await Future<void>.delayed(const Duration(milliseconds: 900));
+      }
+      if (scenario.share != null) {
+        final navigator = _navigator();
+        final session = _sharePreview(scenario.share!);
+        if (navigator != null && navigator.mounted && navigator.overlay != null) {
+          unawaited(showShareSheet(navigator.overlay!.context, session.share, session: session));
+        }
         await Future<void>.delayed(const Duration(milliseconds: 900));
       }
       await Future<void>.delayed(const Duration(milliseconds: 900));

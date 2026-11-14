@@ -36,6 +36,7 @@ optdepends=(
     'hyprland: list monitors for the screen view'
     'wlr-randr: list monitors on other wlroots compositors'
     'imagemagick: cover art and the wallpaper on the phone (ffmpeg works too)'
+    'xdg-utils: open shared links and files, and find the download folder'
 )
 provides=("$_pkgname")
 conflicts=("$_pkgname")

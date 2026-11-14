@@ -262,8 +262,9 @@ class LinkConnection {
   /// `pong`, `pair.accept`).
   /// @throws LinkRemoteException when the reply is an `error`.
   /// @throws LinkTimeoutException after [timeout] (default [LinkProtocol.requestTimeout]).
+  /// @param data Raw bytes that go with the request in a binary frame (`share.chunk`).
   /// @throws LinkConnectionException if the socket closes first.
-  Future<LinkMessage> request(String type, [Map<String, dynamic> body = const {}, Duration? timeout]) {
+  Future<LinkMessage> request(String type, [Map<String, dynamic> body = const {}, Duration? timeout, Uint8List? data]) {
     if (_closed) return Future.error(LinkConnectionException("Not connected to the desktop."));
     final id = _nextId();
     final completer = Completer<LinkMessage>();
@@ -274,7 +275,7 @@ class LinkConnection {
     });
     _pending[id] = _PendingRequest(completer, timer);
     try {
-      _write(LinkMessage(type, id: id, body: body));
+      _write(LinkMessage(type, id: id, body: body, data: data));
     } on LinkException catch (error) {
       _pending.remove(id);
       timer.cancel();

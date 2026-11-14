@@ -8,6 +8,7 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        flutterEngine.plugins.add(ShareIntake())
         // Keeps the screen awake while the touchpad or the screen view is open (ScreenAwake in lib/ui/sources.dart).
         // The flag belongs to this window, so the phone still sleeps normally once the app is left.
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "dev.ionnet.ionix_link/window").setMethodCallHandler { call, result ->

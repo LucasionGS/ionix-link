@@ -5,6 +5,7 @@ import "package:flutter/foundation.dart";
 import "package:flutter/painting.dart";
 
 import "../../link/link.dart";
+import "../../platform/link_platform.dart";
 import "../sources.dart";
 
 /// Made-up data and fake sources for the preview entrypoint. Nothing here talks to a network.
@@ -317,4 +318,45 @@ class FakePairSource extends PairSource {
 
   @override
   Future<void> selectHost(String hostId) async {}
+}
+
+/// A [ShareSource] that is always connected (or has no host) and never sends: the preview freezes its sessions.
+class FakeShareSource extends ShareSource {
+  FakeShareSource({bool paired = true})
+      : hosts = ValueNotifier(paired ? [fakeHost] : []),
+        status = ValueNotifier(paired ? LinkStatus(LinkState.ready, host: fakeHost, address: "192.168.1.42") : LinkStatus.idleStatus);
+
+  @override
+  final ValueNotifier<LinkStatus> status;
+  @override
+  final ValueNotifier<List<PairedHost>> hosts;
+  @override
+  final ValueNotifier<PluginInfo?> plugin = ValueNotifier(PluginInfo(name: LinkPlugins.share, version: 1, caps: ["text", "files"]));
+
+  @override
+  Stream<IncomingShare> get incoming => const Stream.empty();
+
+  @override
+  Future<IncomingShare?> takeLaunchShare() async => null;
+
+  @override
+  bool get canText => true;
+
+  @override
+  bool get canFiles => true;
+
+  @override
+  void reconnect() {}
+
+  @override
+  Future<ShareAction> sendText(String text, {String? subject}) async => ShareAction.copied;
+
+  @override
+  Future<StagedFile> stage(SharedFile file) async => StagedFile(path: file.uri, size: file.size);
+
+  @override
+  ShareUpload sendFile(StagedFile staged, SharedFile file) => throw UnsupportedError("The preview never sends.");
+
+  @override
+  Future<void> clearStaged() async {}
 }

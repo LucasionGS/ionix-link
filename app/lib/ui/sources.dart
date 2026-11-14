@@ -16,6 +16,7 @@ class UiSources {
   static CommandsSource commands = LinkCommandsSource();
   static InputSource input = LinkInputSource();
   static ScreenSource screen = LinkScreenSource();
+  static ShareSource share = LinkShareSource();
 }
 
 //#region Theme
@@ -373,6 +374,82 @@ class LinkScreenSource extends ScreenSource {
 
   @override
   Stream<String> get stopped => Link.screen.stopped;
+}
+
+//#endregion
+
+//#region Share
+
+/// Sharing to the desktop from other apps: the intake from the platform and the sending through the link.
+abstract class ShareSource {
+  /// Shares other apps hand over while the app runs.
+  Stream<IncomingShare> get incoming;
+
+  /// The share the app was started with, once.
+  Future<IncomingShare?> takeLaunchShare();
+
+  ValueListenable<LinkStatus> get status;
+  ValueListenable<List<PairedHost>> get hosts;
+
+  /// The share plugin as negotiated on the current connection, null while offline or unavailable.
+  ValueListenable<PluginInfo?> get plugin;
+
+  bool get canText;
+  bool get canFiles;
+
+  /// Retry the current host now.
+  void reconnect();
+
+  Future<ShareAction> sendText(String text, {String? subject});
+
+  /// Copy [file] where this app can read it.
+  Future<StagedFile> stage(SharedFile file);
+
+  ShareUpload sendFile(StagedFile staged, SharedFile file);
+
+  /// Drop every staged copy.
+  Future<void> clearStaged();
+}
+
+/// [ShareSource] over [LinkPlatform] and [Link.share].
+class LinkShareSource extends ShareSource {
+  @override
+  Stream<IncomingShare> get incoming => LinkPlatform.instance.incomingShares;
+
+  @override
+  Future<IncomingShare?> takeLaunchShare() => LinkPlatform.instance.takeLaunchShare();
+
+  @override
+  ValueListenable<LinkStatus> get status => Link.connectionStatus;
+
+  @override
+  ValueListenable<List<PairedHost>> get hosts => Link.hosts;
+
+  @override
+  ValueListenable<PluginInfo?> get plugin => Link.share.remote;
+
+  @override
+  bool get canText => Link.share.canText;
+
+  @override
+  bool get canFiles => Link.share.canFiles;
+
+  @override
+  void reconnect() => Link.reconnect();
+
+  @override
+  Future<ShareAction> sendText(String text, {String? subject}) => Link.share.sendText(text, subject: subject);
+
+  @override
+  Future<StagedFile> stage(SharedFile file) => LinkPlatform.instance.stageSharedFile(file);
+
+  @override
+  ShareUpload sendFile(StagedFile staged, SharedFile file) {
+    return Link.share.sendFile(path: staged.path, name: file.name, size: staged.size, mime: file.mime, sha256: staged.sha256);
+  }
+
+  @override
+  Future<void> clearStaged() => LinkPlatform.instance.clearStagedFiles();
 }
 
 //#endregion

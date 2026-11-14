@@ -208,4 +208,63 @@ class AndroidPlatform extends LinkPlatform {
       debugPrint("ionix-link: could not ${on ? "keep the screen on" : "let the screen sleep"}: ${error.message}");
     }
   }
+
+  // ShareIntake.kt: shares from other apps, and the cache copies Dart reads in chunks.
+  static const MethodChannel _share = MethodChannel("dev.ionnet.ionix_link/share");
+  final StreamController<IncomingShare> _shares = StreamController.broadcast();
+  bool _shareHandlerSet = false;
+
+  void _listenForShares() {
+    if (_shareHandlerSet) return;
+    _shareHandlerSet = true;
+    _share.setMethodCallHandler((call) async {
+      if (call.method != "share") return;
+      final share = _parseShare(call.arguments);
+      if (share != null) _shares.add(share);
+    });
+  }
+
+  static IncomingShare? _parseShare(Object? raw) {
+    if (raw is! Map) return null;
+    final files = <SharedFile>[];
+    for (final entry in (raw["files"] as List<Object?>? ?? const [])) {
+      if (entry is! Map || entry["uri"] is! String) continue;
+      files.add(SharedFile(
+        uri: entry["uri"] as String,
+        name: entry["name"] is String ? entry["name"] as String : "shared file",
+        size: entry["size"] is int ? entry["size"] as int : -1,
+        mime: entry["mime"] as String?,
+      ));
+    }
+    final share = IncomingShare(text: raw["text"] as String?, subject: raw["subject"] as String?, files: files);
+    return share.isEmpty ? null : share;
+  }
+
+  @override
+  Stream<IncomingShare> get incomingShares {
+    _listenForShares();
+    return _shares.stream;
+  }
+
+  @override
+  Future<IncomingShare?> takeLaunchShare() async {
+    _listenForShares();
+    return _parseShare(await _share.invokeMethod<Object?>("takeLaunchShare"));
+  }
+
+  @override
+  Future<StagedFile> stageSharedFile(SharedFile file) async {
+    final result = await _share.invokeMapMethod<String, Object?>("stage", {"uri": file.uri});
+    if (result == null) throw PlatformException(code: "stage_failed", message: "The file could not be read.");
+    return StagedFile(path: result["path"]! as String, size: result["size"]! as int, sha256: result["sha256"] as String?);
+  }
+
+  @override
+  Future<void> clearStagedFiles() async {
+    try {
+      await _share.invokeMethod<void>("clear");
+    } on PlatformException catch (error) {
+      debugPrint("ionix-link: could not clear shared files: ${error.message}");
+    }
+  }
 }

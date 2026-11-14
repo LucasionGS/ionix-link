@@ -441,6 +441,24 @@ Base palette: `bgDeep #0f0a18`, `bgWindow #1a1025`, `bgCard #2d2d3f`, `hover #3a
 
 The phone stores the last `Theme` (and wallpaper, if it fetched one) per host and applies it at startup before connecting, so the app stays in the desktop's colours while offline. The phone must keep text readable whatever arrives: it derives on-accent text by contrast, not from a token.
 
+### 8.9 `share`
+
+Phone → desktop sharing, from Android's share sheet. Caps: `text` (the desktop has `wl-copy` or `xdg-open`), `files` (its download directory exists and is writable). Phone caps: none. Everything is a request from the phone; the desktop never starts a transfer.
+
+Consent is on the phone: any app there can start a share, so the app sends nothing until the user taps *Send* on a sheet showing what will go and to which desktop, and the desktop then acts on what arrives (opens a link, saves a file) without asking again.
+
+Where files go: `$IONIX_LINK_DOWNLOAD_DIR`, else `xdg-user-dir DOWNLOAD`, else `~/Downloads`. A file is written to a hidden `.<name>.ionix-link-part` in that directory and linked to its final name only after it verified, so a half-received file is never visible and a failed one leaves nothing. Names are sanitised by the desktop (the phone may send anything): basename only, control and bidi characters and `/` `\` removed, no leading dots, trailing dots and spaces trimmed, at most 200 bytes with the extension kept, `file` if nothing is left. A taken name becomes `name (1).ext`, `name (2).ext`: an existing file, or a symlink, is never replaced or followed.
+
+| Type | Dir | Kind | Body |
+|---|---|---|---|
+| `share.text` | P→D | request | `text: str` (≤ 512 KiB, not blank) · `subject: str?` → reply `action: "opened" \| "copied"`. If the whole text, trimmed, is one `http`/`https` URL, the desktop opens it with `xdg-open` and notifies "Link from <phone>" (body: the subject, else the URL); if `xdg-open` fails or the text is anything else it goes to the clipboard (`wl-copy`) with the notification "Text from <phone> copied" (body: first line). `failed` if neither worked. |
+| `share.begin` | P→D | request | `name: str` · `size: int` (bytes, 0..4 GiB) · `mime: str?` → reply `transfer: str`. `invalid_argument` for a bad name or a size over 4 GiB, `failed` when the download disk cannot hold the file, what open transfers still have to write and a 64 MiB margin, `busy` while another transfer is open **on this connection**, `plugin_unavailable` without cap `files`. |
+| `share.chunk` | P→D | **binary** request | header body `transfer: str` · `offset: int`; data ≤ 1 MiB → reply `received: int` (total bytes so far). The phone sends the next chunk only after this reply (one in flight), so a slow link slows the sender instead of queueing. Offsets must be contiguous from 0 and never pass `size`: anything else, a missing data part or a chunk over 1 MiB gets `invalid_argument` **and the transfer is dropped** (part file deleted). `not_found` for an unknown or dropped transfer. |
+| `share.end` | P→D | request | `transfer: str` · `sha256: str` (hex of the whole file) → reply `path: str` (where it was saved) · `name: str` (its final name, which may differ from the one sent). Fewer bytes than `size`: `invalid_argument`. Wrong hash: `failed`. Either way the transfer is dropped and nothing is left. On success the desktop shows the notification "<file> from <phone>" with *Open* (`xdg-open` the file) and *Show in folder* (`org.freedesktop.FileManager1.ShowItems`, else `xdg-open` of the folder). One notification per file. |
+| `share.cancel` | P→D | request | `transfer: str` → `{}`. Idempotent: an unknown transfer is also `{}`. |
+
+A disconnect cancels the transfer, and so does 60 s without a chunk (time the desktop spends writing does not count). A cancel or disconnect that arrives once the file has been linked into place is too late: the file stays and a waiting `share.end` still gets its reply. While transfers are open, `share.begin` counts the bytes they have still to write against the free space, and the desktop checks the free space again every 64 MiB of a file, failing it with `failed` (part file deleted) before the margin is used up. Part files a killed daemon left behind are deleted when they are over 60 s old and no transfer owns them. While a transfer is open the device's entry in `state.json` (§10) carries `transfers: [{ "id": str, "name": str, "size": int, "received": int }]`, updated at most once a second; the field is absent when idle.
+
 ## 9. Control socket (CLI ↔ daemon)
 
 `$XDG_RUNTIME_DIR/ionix-link.sock` (`IONIX_LINK_SOCKET` overrides), `AF_UNIX` stream, mode 0600, removed on daemon exit. **Line-delimited JSON**: UTF-8, one object per line, `\n`-terminated, no newline inside an object. Requests on one connection are answered in order. The daemon takes requests from its own user only (`SO_PEERCRED` uid check).
@@ -486,7 +504,7 @@ Error `code`s: `bad_request`, `unknown_cmd`, `no_device`, `ambiguous_device`, `n
   "pid": 1234,
   "updated": 1763150000000,
   "hostId": "…", "hostName": "myeonix", "port": 47110, "fingerprint": "…",
-  "plugins": ["notifications", "media", "commands", "clipboard", "input", "screen", "status"],
+  "plugins": ["notifications", "media", "commands", "clipboard", "input", "screen", "status", "theme", "share"],
   "pairing": null,
   "devices": [
     { "id": "…", "name": "Pixel 8", "model": "Google Pixel 8", "paired": 1763000000000, "lastSeen": 1763150000000,
@@ -496,4 +514,4 @@ Error `code`s: `bad_request`, `unknown_cmd`, `no_device`, `ambiguous_device`, `n
 }
 ```
 
-`Device` is one entry of `devices` (never the key). `pairing` is `null`, `{ "mode": "qr", "expires": int }`, or `{ "mode": "code", "expires": int, "name": str, "model": str, "code": str }`. `plugins` at the top is what the daemon has available; per device it is what was negotiated.
+`Device` is one entry of `devices` (never the key). `pairing` is `null`, `{ "mode": "qr", "expires": int }`, or `{ "mode": "code", "expires": int, "name": str, "model": str, "code": str }`. `plugins` at the top is what the daemon has available; per device it is what was negotiated. A device that is receiving a shared file (§8.9) also has `transfers: [{ id, name, size, received }]`.

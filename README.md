@@ -18,6 +18,7 @@ Your phone, on speaking terms with your Ionix desktop. Pair once, then read the 
 - **Clipboard**: send the phone's clipboard to the desktop, or fetch the desktop's.
 - **Touchpad and keyboard**: one finger moves, tap clicks, two fingers scroll, and there is a keyboard for when the real one is too far away.
 - **Screen view**: see a monitor on the phone and tap to click.
+- **Share to the desktop**: pick Ionix Link in any app's share menu. Links open on the desktop, text lands on its clipboard, and photos, videos and other files go to its Downloads folder.
 - **Foldables**: one pane when folded, two panes split on the hinge when open, and picture-on-top, controls-below when half open on a table. Folding never loses your place.
 - **Local and private**: everything stays on your network, encrypted, with no account and no cloud.
 

@@ -117,6 +117,44 @@ void main() {
     expect(stats["battery"], {"level": 42, "charging": true});
   }, skip: skip);
 
+  test("share: text, a multi-chunk file, and a cancelled upload", () async {
+    expect(Link.share.canText && Link.share.canFiles, isTrue);
+    expect(await Link.share.sendText("https://example.com/x", subject: "A page"), ShareAction.opened);
+    expect(await Link.share.sendText("some words"), ShareAction.copied);
+
+    final dir = await Directory.systemTemp.createTemp("ionix-link-share-");
+    addTearDown(() => dir.delete(recursive: true));
+    final bytes = Uint8List.fromList(List.generate(ShareClient.chunkSize * 2 + 4321, (i) => (i * 31 + 7) & 0xff));
+    final file = File("${dir.path}/photo.jpg")..writeAsBytesSync(bytes);
+    final upload = Link.share.sendFile(path: file.path, name: "photo.jpg", size: bytes.length, mime: "image/jpeg");
+    final steps = <int>[];
+    upload.progress.addListener(() => steps.add(upload.progress.value.sent));
+    final receipt = await upload.done;
+    expect(receipt.name, "photo.jpg");
+    expect(steps.last, bytes.length);
+    expect(steps.length, greaterThanOrEqualTo(3));
+    expect(upload.progress.value.fraction, 1.0);
+
+    final empty = File("${dir.path}/empty.txt")..writeAsBytesSync(const []);
+    expect((await Link.share.sendFile(path: empty.path, name: "empty.txt", size: 0).done).name, "empty.txt");
+
+    final slow = Link.share.sendFile(path: file.path, name: "cancelled.jpg", size: bytes.length);
+    await waitFor(slow.progress, (p) => p.sent > 0, what: "the first chunk");
+    slow.cancel();
+    await expectLater(slow.done, throwsA(isA<ShareCancelledException>()));
+    // The next upload on the same connection still works.
+    await Link.share.sendFile(path: empty.path, name: "after.txt", size: 0).done;
+
+    final share = (await debug("debug.stats"))["share"] as Map<String, dynamic>;
+    expect((share["texts"] as List).map((t) => (t as Map)["opened"]), [true, false]);
+    expect((share["texts"] as List).first["subject"], "A page");
+    final files = share["files"] as List;
+    expect(files.map((f) => (f as Map)["name"]), ["photo.jpg", "empty.txt", "after.txt"]);
+    expect(files.first["ok"], isTrue);
+    expect(files.first["size"], bytes.length);
+    expect(share["cancelled"], 1);
+  }, skip: skip);
+
   test("pointer moves are coalesced, buttons keep their place", () async {
     for (var i = 0; i < 1000; i++) {
       Link.input.move(1, -1);
