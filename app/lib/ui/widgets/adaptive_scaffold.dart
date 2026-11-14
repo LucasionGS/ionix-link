@@ -18,6 +18,7 @@ enum ShellSection { home, settings }
 class ShellController extends ChangeNotifier {
   ShellSection _section = ShellSection.home;
   String? _plugin;
+  bool _fullscreen = false;
 
   /// The section shown in the dashboard pane.
   ShellSection get section => _section;
@@ -40,6 +41,17 @@ class ShellController extends ChangeNotifier {
   void closePlugin() {
     if (_plugin == null) return;
     _plugin = null;
+    _fullscreen = false;
+    notifyListeners();
+  }
+
+  /// Whether the open page has taken over the whole window (the screen viewer). Lives here, with the selection,
+  /// so a fold or unfold keeps it.
+  bool get fullscreen => _fullscreen;
+
+  void setFullscreen(bool value) {
+    if (_fullscreen == value) return;
+    _fullscreen = value;
     notifyListeners();
   }
 }
@@ -132,25 +144,41 @@ class _AppShellState extends State<AppShell> {
         builder: (context, _) {
           final controller = widget.controller;
           final plugin = controller.openPlugin;
-          if (layout.isTwoPane) return _twoPane(context, layout, controller);
-          if (plugin != null) {
-            return PopScope(
-              canPop: false,
-              onPopInvokedWithResult: (didPop, _) => controller.closePlugin(),
-              child: _pluginPage(context, plugin),
+          final Widget body;
+          if (layout.isTwoPane) {
+            body = _twoPane(context, layout, controller);
+          }
+          else if (plugin != null) {
+            body = _pluginPage(context, plugin);
+          }
+          else {
+            final bottom = MediaQuery.paddingOf(context).bottom;
+            body = Stack(
+              children: [
+                Positioned.fill(child: _sectionPage(controller.section)),
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: bottom + 22,
+                  child: Center(child: _Navigation(vertical: false, active: _activeIndex(controller), onSelect: (i) => _select(controller, i))),
+                ),
+              ],
             );
           }
-          final bottom = MediaQuery.paddingOf(context).bottom;
-          return Stack(
-            children: [
-              Positioned.fill(child: _sectionPage(controller.section)),
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: bottom + 22,
-                child: Center(child: _Navigation(vertical: false, active: _activeIndex(controller), onSelect: (i) => _select(controller, i))),
-              ),
-            ],
+          // Back leaves full screen first, then (on a single pane) closes the open page.
+          final closesPage = !layout.isTwoPane && plugin != null;
+          return PopScope(
+            canPop: !controller.fullscreen && !closesPage,
+            onPopInvokedWithResult: (didPop, _) {
+              if (didPop) return;
+              if (controller.fullscreen) {
+                controller.setFullscreen(false);
+              }
+              else {
+                controller.closePlugin();
+              }
+            },
+            child: body,
           );
         },
       ),

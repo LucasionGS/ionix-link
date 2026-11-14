@@ -1,20 +1,28 @@
 import "dart:async";
 
+import "package:flutter/services.dart";
 import "package:material_ui/material_ui.dart";
 
 import "../../link/link.dart";
 import "../sources.dart";
 import "../theme.dart";
+import "../widgets/adaptive_scaffold.dart";
 import "../widgets/empty_state.dart";
 import "../widgets/floating_bar.dart";
 import "../widgets/fold_split.dart";
 import "../widgets/ion_page.dart";
+import "../widgets/keys_panel.dart";
 import "../widgets/touchpad.dart";
+import "../widgets/window_layout.dart";
 
 /// Screen viewer: output picker, then the desktop's frames painted with `Image.memory(gaplessPlayback: true)` and
 /// acknowledged once shown; a tap is a click at that spot, a drag moves the pointer there, a pinch zooms, and two
 /// fingers scroll (or pan when zoomed in). The stream stops when the page goes away. In tabletop posture the picture
 /// is on the upright half and a touchpad with keys on the flat one.
+///
+/// Full screen ([ShellController.fullscreen]) hosts the same viewer, with the same stream, in the root overlay
+/// through an [OverlayPortal], so it covers the dock, the rail and both panes, spans a fold, and survives a fold or
+/// unfold with nothing restarting.
 class ScreenPage extends StatefulWidget {
   const ScreenPage({super.key});
 
@@ -61,6 +69,70 @@ class _ScreenPageState extends State<ScreenPage> {
   int _pointerCount = 0;
   Size _viewSize = Size.zero;
 
+  // Full screen.
+  final OverlayPortalController _portal = OverlayPortalController();
+  ShellController? _shell;
+  bool _full = false;
+  bool _cluster = true;
+  Timer? _clusterTimer;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final shell = ShellScope.of(context);
+    if (identical(shell, _shell)) return;
+    _shell?.removeListener(_onShell);
+    _shell = shell..addListener(_onShell);
+  }
+
+  void _onShell() {
+    final full = _shell?.fullscreen ?? false;
+    if (full == _full || !mounted) return;
+    setState(() {
+      _full = full;
+      _zoom = 1;
+      _pan = Offset.zero;
+    });
+    if (full) {
+      _portal.show();
+      _showCluster();
+    }
+    else {
+      _portal.hide();
+      _clusterTimer?.cancel();
+    }
+    _applySystemUi(full);
+  }
+
+  /// Hides the system bars and allows every orientation while full screen; the app is edge to edge and never locks
+  /// an orientation otherwise.
+  Future<void> _applySystemUi(bool full) async {
+    try {
+      await SystemChrome.setEnabledSystemUIMode(full ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge);
+      await SystemChrome.setPreferredOrientations(const []);
+    } catch (e) {
+      debugPrint("Could not change the system bars: $e");
+    }
+  }
+
+  void _showCluster() {
+    _clusterTimer?.cancel();
+    setState(() => _cluster = true);
+    _clusterTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _cluster = false);
+    });
+  }
+
+  void _toggleCluster() {
+    if (_cluster) {
+      _clusterTimer?.cancel();
+      setState(() => _cluster = false);
+    }
+    else {
+      _showCluster();
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -89,6 +161,12 @@ class _ScreenPageState extends State<ScreenPage> {
 
   @override
   void dispose() {
+    _clusterTimer?.cancel();
+    final shell = _shell?..removeListener(_onShell);
+    if (_full) {
+      _applySystemUi(false);
+      WidgetsBinding.instance.addPostFrameCallback((_) => shell?.setFullscreen(false));
+    }
     _fpsTimer?.cancel();
     _frames?.cancel();
     _stopped?.cancel();
@@ -156,7 +234,23 @@ class _ScreenPageState extends State<ScreenPage> {
     final center = _viewSize.center(Offset.zero);
     final unzoomed = center + (local - center - _pan) / _zoom;
     final rect = _fitted(_viewSize, frame);
-    return Offset(((unzoomed.dx - rect.left) / rect.width).clamp(0.0, 1.0), ((unzoomed.dy - rect.top) / rect.height).clamp(0.0, 1.0));
+    if (!rect.contains(unzoomed)) return null;
+    return Offset((unzoomed.dx - rect.left) / rect.width, (unzoomed.dy - rect.top) / rect.height);
+  }
+
+  void _setViewSize(Size size) {
+    if ((size.width - _viewSize.width).abs() < 1 && (size.height - _viewSize.height).abs() < 1) return;
+    final hadSize = !_viewSize.isEmpty;
+    _viewSize = size;
+    if (hadSize && (_zoom != 1 || _pan != Offset.zero)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        setState(() {
+          _zoom = 1;
+          _pan = Offset.zero;
+        });
+      });
+    }
   }
 
   void _pointTo(Offset local) {
@@ -193,6 +287,7 @@ class _ScreenPageState extends State<ScreenPage> {
   }
 
   void _onTapUp(TapUpDetails d) {
+    if (_toNormalised(d.localPosition) == null) return;
     _pointTo(d.localPosition);
     _input.button(PointerButton.left, ButtonAction.click);
   }
@@ -239,52 +334,32 @@ class _ScreenPageState extends State<ScreenPage> {
     if (output != null && mounted) await _start(output);
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final t = IonixTokens.of(context);
+  Widget _viewer({required bool bare}) {
     final outputs = _outputs;
-    final Widget viewer;
     if (_error != null) {
-      viewer = EmptyState(icon: Icons.desktop_access_disabled_outlined, title: "Can't list the screens", message: _error, actionLabel: "Try again", action: _loadOutputs);
+      return EmptyState(icon: Icons.desktop_access_disabled_outlined, title: "Can't list the screens", message: _error, actionLabel: "Try again", action: _loadOutputs);
     }
-    else if (outputs == null) {
-      viewer = const Center(child: CircularProgressIndicator());
+    if (outputs == null) return const Center(child: CircularProgressIndicator());
+    if (outputs.isEmpty) {
+      return const EmptyState(icon: Icons.desktop_access_disabled_outlined, title: "No screens found", message: "Your desktop didn't report any display to show.");
     }
-    else if (outputs.isEmpty) {
-      viewer = const EmptyState(icon: Icons.desktop_access_disabled_outlined, title: "No screens found", message: "Your desktop didn't report any display to show.");
-    }
-    else {
-      viewer = _Viewer(
-        frame: _frame,
-        starting: _starting,
-        fps: _shownFps,
-        zoom: _zoom,
-        pan: _pan,
-        onSize: (s) => _viewSize = s,
-        onAck: _ack,
-        onScaleStart: _onScaleStart,
-        onScaleUpdate: _onScaleUpdate,
-        onTapUp: _onTapUp,
-      );
-    }
+    return _Viewer(
+      frame: _frame,
+      starting: _starting,
+      fps: _shownFps,
+      zoom: _zoom,
+      pan: _pan,
+      bare: bare,
+      onSize: _setViewSize,
+      onAck: _ack,
+      onScaleStart: _onScaleStart,
+      onScaleUpdate: _onScaleUpdate,
+      onTapUp: _onTapUp,
+    );
+  }
 
-    final picker = (outputs == null || outputs.length < 2)
-        ? const SizedBox.shrink()
-        : SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: IonixSpace.md, vertical: IonixSpace.xs),
-            child: Row(
-              children: [
-                for (final o in outputs)
-                  Padding(
-                    padding: const EdgeInsets.only(right: IonixSpace.sm),
-                    child: ChoiceChip(label: Text(o.name), selected: o.name == _output, onSelected: (_) => _start(o.name)),
-                  ),
-              ],
-            ),
-          );
-
-    final pad = Padding(
+  Widget _pad() {
+    return Padding(
       padding: const EdgeInsets.all(IonixSpace.md),
       child: Column(
         children: [
@@ -304,23 +379,167 @@ class _ScreenPageState extends State<ScreenPage> {
         ],
       ),
     );
+  }
 
-    return IonPage(
-      title: "Screen",
-      plugin: true,
-      actions: [BarPill(icon: Icons.tune_rounded, tooltip: "Picture options", onTap: _output == null ? null : _showOptions)],
-      body: FoldSplit(
-        top: Column(children: [picker, Expanded(child: Padding(padding: const EdgeInsets.all(IonixSpace.md), child: viewer))]),
-        bottom: pad,
-        flat: Column(
-          children: [
-            Expanded(child: Padding(padding: const EdgeInsets.fromLTRB(IonixSpace.md, IonixSpace.xs, IonixSpace.md, IonixSpace.xs), child: viewer)),
-            picker,
-            Padding(
-              padding: const EdgeInsets.fromLTRB(IonixSpace.lg, 0, IonixSpace.lg, IonixSpace.sm),
-              child: Text("Tap to click · drag to point · pinch to zoom · two fingers to scroll", style: Theme.of(context).textTheme.bodySmall?.copyWith(color: t.dim), textAlign: TextAlign.center),
+  Future<void> _showKeyboard() async {
+    _clusterTimer?.cancel();
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (context) => SafeArea(child: Padding(padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom), child: KeysPanel(input: _input))),
+    );
+    if (mounted && _full) _showCluster();
+  }
+
+  /// The full-screen layer: the picture over the whole window (the upright half only in tabletop posture, with the
+  /// touchpad and keys on the flat half) and the auto-hiding controls.
+  Widget _fullscreen(BuildContext context) {
+    final root = MediaQuery.of(Overlay.of(context, rootOverlay: true).context);
+    return MediaQuery(
+      data: root,
+      child: Builder(
+        builder: (context) {
+          final t = IonixTokens.of(context);
+          final layout = WindowLayout.of(context);
+          final padding = MediaQuery.paddingOf(context);
+          final picture = ColoredBox(color: t.bgDeep, child: _viewer(bare: true));
+          final Widget content = layout.isTabletop
+              ? ColoredBox(
+                  color: t.bgDeep,
+                  child: FoldSplit(top: picture, bottom: SafeArea(top: false, child: _pad()), flat: picture),
+                )
+              : picture;
+
+          // Controls stay inside the safe area, left of a vertical fold and above a horizontal one.
+          final fold = layout.fold;
+          final left = padding.left + 12;
+          final top = padding.top + 8;
+          final right = layout.hasVerticalFold ? fold!.left - 8 : layout.size.width - padding.right - 12;
+          final outputs = _outputs ?? const <ScreenOutput>[];
+          final frame = _frame;
+          return Material(
+            color: t.bgDeep,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                content,
+                Positioned(
+                  left: left,
+                  top: top,
+                  width: (right - left).clamp(44.0, layout.size.width),
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.topLeft,
+                    child: Row(
+                      children: [
+                        Tooltip(
+                          message: "Controls",
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: _toggleCluster,
+                            child: Container(
+                              width: 44,
+                              height: 44,
+                              decoration: t.bar(),
+                              child: Icon(_cluster ? Icons.keyboard_arrow_left_rounded : Icons.more_horiz_rounded, color: t.accentLight),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: IonixSpace.sm),
+                        IgnorePointer(
+                          ignoring: !_cluster,
+                          child: AnimatedOpacity(
+                            opacity: _cluster ? 1 : 0,
+                            duration: const Duration(milliseconds: 200),
+                            child: Container(
+                              height: 44,
+                              padding: const EdgeInsets.symmetric(horizontal: 4),
+                              decoration: t.bar(),
+                              child: Row(
+                                children: [
+                                  IconButton(tooltip: "Leave full screen", icon: Icon(Icons.fullscreen_exit_rounded, color: t.textBright), onPressed: () => _shell?.setFullscreen(false)),
+                                  if (outputs.length > 1)
+                                    PopupMenuButton<String>(
+                                      tooltip: "Screens",
+                                      icon: Icon(Icons.desktop_windows_outlined, color: t.textBright),
+                                      onOpened: _clusterTimer?.cancel,
+                                      onCanceled: _showCluster,
+                                      onSelected: (name) {
+                                        _start(name);
+                                        _showCluster();
+                                      },
+                                      itemBuilder: (_) => [for (final o in outputs) CheckedPopupMenuItem<String>(value: o.name, checked: o.name == _output, child: Text(o.name))],
+                                    ),
+                                  IconButton(tooltip: "Keyboard", icon: Icon(Icons.keyboard_outlined, color: t.textBright), onPressed: _showKeyboard),
+                                  IconButton(tooltip: "Picture options", icon: Icon(Icons.tune_rounded, color: t.textBright), onPressed: _output == null ? null : _showOptions),
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: IonixSpace.sm),
+                                    child: Text(frame == null ? "…" : "${frame.width}×${frame.height} · $_shownFps fps${_zoom > 1.01 ? " · ${_zoom.toStringAsFixed(1)}×" : ""}", style: Theme.of(context).textTheme.labelMedium?.copyWith(color: t.textBright)),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
             ),
-          ],
+          );
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = IonixTokens.of(context);
+    final outputs = _outputs;
+    final viewer = _full ? const SizedBox.expand() : _viewer(bare: false);
+
+    final picker = (outputs == null || outputs.length < 2)
+        ? const SizedBox.shrink()
+        : SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: IonixSpace.md, vertical: IonixSpace.xs),
+            child: Row(
+              children: [
+                for (final o in outputs)
+                  Padding(
+                    padding: const EdgeInsets.only(right: IonixSpace.sm),
+                    child: ChoiceChip(label: Text(o.name), selected: o.name == _output, onSelected: (_) => _start(o.name)),
+                  ),
+              ],
+            ),
+          );
+
+    return OverlayPortal(
+      controller: _portal,
+      overlayLocation: OverlayChildLocation.rootOverlay,
+      overlayChildBuilder: _fullscreen,
+      child: IonPage(
+        title: "Screen",
+        plugin: true,
+        actions: [
+          BarPill(icon: Icons.fullscreen_rounded, tooltip: "Full screen", onTap: _output == null ? null : () => _shell?.setFullscreen(true)),
+          BarPill(icon: Icons.tune_rounded, tooltip: "Picture options", onTap: _output == null ? null : _showOptions),
+        ],
+        body: FoldSplit(
+          top: Column(children: [picker, Expanded(child: Padding(padding: const EdgeInsets.all(IonixSpace.md), child: viewer))]),
+          bottom: _pad(),
+          flat: Column(
+            children: [
+              Expanded(child: Padding(padding: const EdgeInsets.fromLTRB(IonixSpace.md, IonixSpace.xs, IonixSpace.md, IonixSpace.xs), child: viewer)),
+              picker,
+              Padding(
+                padding: const EdgeInsets.fromLTRB(IonixSpace.lg, 0, IonixSpace.lg, IonixSpace.sm),
+                child: Text("Tap to click · drag to point · pinch to zoom · two fingers to scroll", style: Theme.of(context).textTheme.bodySmall?.copyWith(color: t.dim), textAlign: TextAlign.center),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -334,6 +553,7 @@ class _Viewer extends StatelessWidget {
     required this.fps,
     required this.zoom,
     required this.pan,
+    required this.bare,
     required this.onSize,
     required this.onAck,
     required this.onScaleStart,
@@ -346,6 +566,9 @@ class _Viewer extends StatelessWidget {
   final int fps;
   final double zoom;
   final Offset pan;
+
+  /// Edge to edge, with no frame or frame statistics, for full screen.
+  final bool bare;
   final ValueChanged<Size> onSize;
   final ValueChanged<int> onAck;
   final GestureScaleStartCallback onScaleStart;
@@ -356,9 +579,9 @@ class _Viewer extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = IonixTokens.of(context);
     return DecoratedBox(
-      decoration: BoxDecoration(color: t.bgDeep, borderRadius: t.rSm, border: Border.all(color: t.accentBright.withValues(alpha: 0.25))),
+      decoration: bare ? BoxDecoration(color: t.bgDeep) : BoxDecoration(color: t.bgDeep, borderRadius: t.rSm, border: Border.all(color: t.accentBright.withValues(alpha: 0.25))),
       child: ClipRRect(
-        borderRadius: t.rSm,
+        borderRadius: bare ? BorderRadius.zero : t.rSm,
         child: LayoutBuilder(
           builder: (context, constraints) {
             onSize(constraints.biggest);
@@ -403,7 +626,8 @@ class _Viewer extends StatelessWidget {
                       },
                     ),
                   ),
-                  Positioned(
+                  if (!bare)
+                    Positioned(
                     right: 8,
                     bottom: 8,
                     child: Container(

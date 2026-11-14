@@ -45,7 +45,7 @@ const LinkTheme _winix = LinkTheme(
 );
 
 class _Scenario {
-  const _Scenario(this.name, this.size, {this.theme = LinkTheme.ionix, this.open, this.features = const [], this.paired = true, this.offline = false, this.code = false, this.settings = false, this.thenSize, this.thenFeatures = const []});
+  const _Scenario(this.name, this.size, {this.theme = LinkTheme.ionix, this.open, this.features = const [], this.paired = true, this.offline = false, this.code = false, this.settings = false, this.fullscreen = false, this.thenSize, this.thenFeatures = const []});
 
   final String name;
   final Size size;
@@ -56,6 +56,9 @@ class _Scenario {
   final bool offline;
   final bool code;
   final bool settings;
+
+  /// Enter full screen once the page is up (screen viewer only).
+  final bool fullscreen;
 
   /// Resize to this after the first picture, in the same app instance, as a fold or unfold would.
   final Size? thenSize;
@@ -106,6 +109,13 @@ final List<_Scenario> _scenarios = [
   const _Scenario("book-turned-media", _bookOpenTurned, open: LinkPlugins.media, features: _bookFoldTurned),
   const _Scenario("book-tabletop-screen", _bookOpenTurned, open: LinkPlugins.screen, features: _bookTabletop),
   const _Scenario("book-tabletop-media", _bookOpenTurned, open: LinkPlugins.media, features: _bookTabletop),
+  const _Scenario("fs-phone", _phone, open: LinkPlugins.screen, fullscreen: true),
+  const _Scenario("fs-phone-landscape", Size(915, 412), open: LinkPlugins.screen, fullscreen: true),
+  const _Scenario("fs-book-cover", _bookCover, open: LinkPlugins.screen, fullscreen: true),
+  const _Scenario("fs-book-open", _bookOpen, open: LinkPlugins.screen, features: _bookFold, fullscreen: true),
+  const _Scenario("fs-book-tabletop", _bookOpenTurned, open: LinkPlugins.screen, features: _bookTabletop, fullscreen: true),
+  _Scenario("fs-book-tabletop-winix", _bookOpenTurned, theme: _winix, open: LinkPlugins.screen, features: _bookTabletop, fullscreen: true),
+  const _Scenario("fs-fold-switch", _bookCover, open: LinkPlugins.screen, fullscreen: true, thenSize: _bookOpen, thenFeatures: _bookFold),
 ];
 
 Future<void> main() async {
@@ -157,6 +167,10 @@ class _PreviewState extends State<_Preview> {
         _generation++;
       });
       await Future<void>.delayed(const Duration(milliseconds: 700));
+      if (scenario.fullscreen) {
+        shell.setFullscreen(true);
+        await Future<void>.delayed(const Duration(milliseconds: 900));
+      }
       if (scenario.code) {
         _navigator()?.push(MaterialPageRoute<void>(builder: (_) => CodeConfirmPage(host: DiscoveredHost(id: "a" * 32, name: "myeonix", address: "192.168.1.42", port: 47110, fingerprint: "b" * 64, protocol: 1, protocolMin: 1))));
         await Future<void>.delayed(const Duration(milliseconds: 900));
@@ -177,7 +191,7 @@ class _PreviewState extends State<_Preview> {
         final afterData = await after.toByteData(format: ui.ImageByteFormat.png);
         File("${out.path}/${scenario.name}-unfolded.png").writeAsBytesSync(afterData!.buffer.asUint8List());
         final screen = UiSources.screen as FakeScreenSource;
-        stdout.writeln("fold check ${scenario.name}: starts=${screen.starts} stops=${screen.stops} open=${shell.openPlugin}");
+        stdout.writeln("fold check ${scenario.name}: starts=${screen.starts} stops=${screen.stops} open=${shell.openPlugin} fullscreen=${shell.fullscreen}");
       }
       _size = null;
       _features = null;
