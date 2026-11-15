@@ -274,7 +274,7 @@ mac    7c0ad5f413446203954a9262d09fd5a3df91edb941f35deaf0d44a1a23eb09a3
 | `unknown_device` | yes | `hello` from a device that is not paired. |
 | `auth_failed` | yes | Bad `mac`. |
 | `rate_limited` | yes | Too many auth failures. |
-| `replaced` | yes | Another connection authenticated for this device. |
+| `replaced` | yes | Another connection authenticated for this device. The phone waits at least 30 s before reconnecting, so two copies of the app never take the connection from each other in a loop. |
 | `plugin_unavailable` | no | Request for a plugin not negotiated on this connection. |
 | `invalid_argument` | no | A body field has a bad value (unknown output, scale out of range…). |
 | `not_found` | no | Named thing does not exist (command id, player, notification). |

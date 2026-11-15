@@ -262,6 +262,15 @@ class AndroidPlatform extends LinkPlatform {
   static const MethodChannel _window = MethodChannel("dev.ionnet.ionix_link/window");
 
   @override
+  Future<void> returnToPreviousApp() async {
+    try {
+      await _window.invokeMethod<bool>("moveToBack");
+    } on PlatformException catch (error) {
+      debugPrint("ionix-link: could not return to the previous app: ${error.message}");
+    }
+  }
+
+  @override
   Future<void> setKeepScreenOn(bool on) async {
     try {
       await _window.invokeMethod<void>("keepScreenOn", on);

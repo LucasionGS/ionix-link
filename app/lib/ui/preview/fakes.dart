@@ -366,4 +366,7 @@ class FakeShareSource extends ShareSource {
 
   @override
   Future<void> clearStaged() async {}
+
+  @override
+  void returnToSender() {}
 }

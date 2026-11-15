@@ -71,6 +71,10 @@ class LinkProtocol {
   static const Duration discoveryRepeat = Duration(milliseconds: 300);
 
   /// Reconnect delays, in order; the last one repeats.
+  /// Least wait before reconnecting after the desktop said `replaced` (another live connection has this phone's
+  /// identity), so two copies of the app never take the connection from each other in a loop.
+  static const Duration replacedRetryDelay = Duration(seconds: 30);
+
   static const List<Duration> reconnectBackoff = [
     Duration(seconds: 1),
     Duration(seconds: 2),

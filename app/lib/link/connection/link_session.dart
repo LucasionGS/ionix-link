@@ -230,7 +230,11 @@ class LinkSession {
       _forget(LinkAuthException(reason.message, code: reason.code));
       return;
     }
-    _scheduleRetry(reason is LinkException ? reason : LinkConnectionException("The connection to ${_current.name} closed."));
+    // `replaced` means another connection with this phone's identity is live on the desktop (a second copy of the
+    // app). Coming straight back would take it over again, and the two would replace each other in a loop.
+    final replaced = reason is LinkRemoteException && reason.code == LinkErrorCode.replaced;
+    _scheduleRetry(reason is LinkException ? reason : LinkConnectionException("The connection to ${_current.name} closed."),
+        minDelay: replaced ? LinkProtocol.replacedRetryDelay : null);
   }
 
   void _onUnpaired(LinkConnection connection) {
@@ -252,9 +256,10 @@ class LinkSession {
     _scheduleRetry(error);
   }
 
-  void _scheduleRetry(LinkException error) {
+  void _scheduleRetry(LinkException error, {Duration? minDelay}) {
     final delays = LinkProtocol.reconnectBackoff;
-    final delay = delays[_failures < delays.length ? _failures : delays.length - 1];
+    var delay = delays[_failures < delays.length ? _failures : delays.length - 1];
+    if (minDelay != null && delay < minDelay) delay = minDelay;
     _failures++;
     _retryTimer?.cancel();
     _retryTimer = Timer(delay, () {

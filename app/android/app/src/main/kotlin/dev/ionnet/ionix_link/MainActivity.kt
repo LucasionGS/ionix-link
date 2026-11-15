@@ -23,6 +23,8 @@ class MainActivity : FlutterActivity() {
                     }
                     result.success(null)
                 }
+                // After a share: back to the app it came from, since shares now open in this app's own task.
+                "moveToBack" -> result.success(moveTaskToBack(true))
                 else -> result.notImplemented()
             }
         }

@@ -114,6 +114,9 @@ abstract class LinkPlatform {
   /// leaving the app lets the phone sleep as usual).
   Future<void> setKeepScreenOn(bool on);
 
+  /// Send the app to the background, showing whatever was in front before it (the app a share came from).
+  Future<void> returnToPreviousApp();
+
   // Sharing into the app
 
   /// What other apps share to this one (Android's share sheet) while the app is running.

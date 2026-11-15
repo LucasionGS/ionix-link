@@ -101,6 +101,9 @@ class FallbackPlatform extends LinkPlatform {
   @override
   Future<void> setKeepScreenOn(bool on) async {}
 
+  @override
+  Future<void> returnToPreviousApp() async {}
+
   final StreamController<IncomingShare> _shares = StreamController.broadcast();
 
   /// Pretend another app shared [share] (Linux has no share sheet; the headless checks use this).

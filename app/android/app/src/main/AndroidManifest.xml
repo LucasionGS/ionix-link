@@ -16,11 +16,14 @@
         android:label="Ionix Link"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <!-- singleTask, in the app's own task: a share from another app's share menu targets the sender's
+             task, and under singleTop that started a second MainActivity there, with its own Flutter engine and
+             its own connection. The two copies then replaced each other on the desktop in a loop. Now a share
+             reaches the running instance through onNewIntent (ShareIntake). -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop"
-            android:taskAffinity=""
+            android:launchMode="singleTask"
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"

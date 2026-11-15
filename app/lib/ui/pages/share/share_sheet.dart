@@ -1,6 +1,7 @@
 import "package:material_ui/material_ui.dart";
 
 import "../../../platform/link_platform.dart";
+import "../../sources.dart";
 import "../../theme.dart";
 import "../../widgets/ion_card.dart";
 import "share_session.dart";
@@ -293,24 +294,30 @@ class _Buttons extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     void close() => Navigator.of(context).maybePop();
+    // Finished with this share: close the sheet and go back to the app it came from, as a share target should.
+    // Not for "Pair", which stays here on purpose.
+    void finish() {
+      close();
+      UiSources.share.returnToSender();
+    }
     switch (session.stage) {
       case ShareStage.confirm:
         return Row(
           mainAxisAlignment: MainAxisAlignment.end,
           children: [
-            TextButton(onPressed: () { session.cancel(); close(); }, child: const Text("Cancel")),
+            TextButton(onPressed: () { session.cancel(); finish(); }, child: const Text("Cancel")),
             const SizedBox(width: IonixSpace.sm),
             FilledButton.icon(onPressed: session.send, icon: const Icon(Icons.send_rounded, size: 18), label: const Text("Send")),
           ],
         );
       case ShareStage.waiting:
       case ShareStage.sending:
-        return Align(alignment: Alignment.centerRight, child: TextButton(onPressed: () { session.cancel(); close(); }, child: const Text("Cancel")));
+        return Align(alignment: Alignment.centerRight, child: TextButton(onPressed: () { session.cancel(); finish(); }, child: const Text("Cancel")));
       case ShareStage.failed:
         return Row(
           mainAxisAlignment: MainAxisAlignment.end,
           children: [
-            TextButton(onPressed: close, child: const Text("Close")),
+            TextButton(onPressed: finish, child: const Text("Close")),
             const SizedBox(width: IonixSpace.sm),
             FilledButton(onPressed: session.retry, child: const Text("Try again")),
           ],
@@ -326,9 +333,9 @@ class _Buttons extends StatelessWidget {
         );
       case ShareStage.unsupported:
       case ShareStage.cancelled:
-        return Align(alignment: Alignment.centerRight, child: FilledButton(onPressed: close, child: const Text("Close")));
+        return Align(alignment: Alignment.centerRight, child: FilledButton(onPressed: finish, child: const Text("Close")));
       case ShareStage.done:
-        return Align(alignment: Alignment.centerRight, child: FilledButton(onPressed: close, child: const Text("Done")));
+        return Align(alignment: Alignment.centerRight, child: FilledButton(onPressed: finish, child: const Text("Done")));
     }
   }
 }

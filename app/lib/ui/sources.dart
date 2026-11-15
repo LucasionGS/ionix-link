@@ -421,6 +421,9 @@ abstract class ShareSource {
 
   /// Drop every staged copy.
   Future<void> clearStaged();
+
+  /// Back to the app the share came from, once the sheet is finished with.
+  void returnToSender();
 }
 
 /// [ShareSource] over [LinkPlatform] and [Link.share].
@@ -462,6 +465,9 @@ class LinkShareSource extends ShareSource {
 
   @override
   Future<void> clearStaged() => LinkPlatform.instance.clearStagedFiles();
+
+  @override
+  void returnToSender() => unawaited(LinkPlatform.instance.returnToPreviousApp());
 }
 
 //#endregion
