@@ -257,6 +257,99 @@ void main() {
     expect(stats["videoAcks"], [1, 10]);
   }, skip: skip);
 
+  test("desktop: open, resize, the virtual output, hires video, touch sets, keyboard, closed push and busy", () async {
+    expect([Link.desktop.hasTouch, Link.desktop.hasIme, Link.desktop.hasNav, Link.screen.canHires], [true, true, true, true]);
+    final first = await Link.desktop.open(width: 1080, height: 2400, scale: 1.75);
+    expect([first.output, first.width, first.height, first.scale, first.logicalWidth, first.created], ["IONIX-LINK-1", 1080, 2400, 1.75, 617, true]);
+    expect(Link.desktop.info.value?.output, "IONIX-LINK-1");
+    // Open again: a resize in place.
+    final resized = await Link.desktop.open(width: 2160, height: 1800, scale: 2.0);
+    expect([resized.created, resized.width, resized.logicalHeight], [false, 2160, 900]);
+
+    // The virtual output is flagged, and the ordinary picker's list is what is left without it.
+    final outputs = await Link.screen.outputs();
+    expect(outputs.where((o) => o.virtual).single.name, "IONIX-LINK-1");
+    expect([for (final o in outputs) if (!o.virtual) o.name], ["HEADLESS-1"]);
+
+    // The stream the page starts: native pixels at 60 fps.
+    final video = Link.screen.video.listen((unit) => Link.screen.ack(unit.seq));
+    await Link.screen.start("IONIX-LINK-1", scale: 4.0, maxFps: 60, format: ScreenClient.formatH264, bitrate: 12000000);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    await video.cancel();
+    final started = (await debug("debug.stats"))["videoStart"] as Map;
+    expect([started["output"], started["scale"], started["maxFps"], started["bitrate"]], ["IONIX-LINK-1", 4.0, 60, 12000000]);
+    await Link.screen.stop();
+
+    // Touches are sets: ids that change go at once, motion is coalesced, [] lifts everything.
+    Link.desktop.touch(const [DesktopTouch(0, 0.1, 0.2)]);
+    for (var i = 0; i < 50; i++) {
+      Link.desktop.touch([DesktopTouch(0, 0.1 + i / 1000, 0.2)]);
+    }
+    Link.desktop.touch(const [DesktopTouch(0, 0.5, 0.5), DesktopTouch(1, 0.6, 0.6)]);
+    Link.desktop.touch(const [DesktopTouch(1, 0.6, 0.6)]);
+    Link.desktop.touch(const []);
+    late List<dynamic> sets;
+    for (var i = 0; i < 50; i++) {
+      sets = ((await debug("debug.stats"))["desktop"] as Map)["touches"] as List<dynamic>;
+      if (sets.isNotEmpty && (sets.last as List).isEmpty) break;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    List<int> ids(int at) => [for (final touch in sets[at] as List) (touch as Map)["id"] as int];
+    expect(sets.first, [{"id": 0, "x": 0.1, "y": 0.2}]);
+    expect(sets.any((set) => (set as List).length == 2), isTrue);
+    expect([for (var i = 0; i < sets.length; i++) ids(i).length], contains(1));
+    expect(ids(sets.length - 2), [1]);
+    expect(sets.last, isEmpty);
+    // 50 moves in one go are a handful of messages, never fifty.
+    expect(sets.length, lessThan(12));
+    // Fingers that are not down cannot be lifted twice: nothing more is sent for another [].
+    final count = sets.length;
+    Link.desktop.touch(const []);
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect((((await debug("debug.stats"))["desktop"] as Map)["touches"] as List).length, count);
+
+    // Keyboard: the commit and the nav arrive, and the desktop's text-input push is mirrored.
+    Link.desktop.commit(text: "héllo", deleteBefore: 2);
+    Link.desktop.nav(DesktopClient.navBack);
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    final desktop = (await debug("debug.stats"))["desktop"] as Map;
+    expect(desktop["commits"], [{"text": "héllo", "deleteBefore": 2}]);
+    expect(desktop["navs"], ["back"]);
+    await debug("debug.textInput", {"active": true, "purpose": "email"});
+    await waitFor(Link.desktop.textInput, (input) => input != null, what: "textInput");
+    expect(Link.desktop.textInput.value?.purpose, DesktopTextPurpose.email);
+    await debug("debug.textInput", {"active": false});
+    await waitFor(Link.desktop.textInput, (input) => input == null, what: "textInput off");
+
+    // The desktop closes it: the push, and no info any more.
+    final closed = Link.desktop.closed.first;
+    await debug("debug.desktopClosed", {"reason": "failed"});
+    expect(await closed.timeout(const Duration(seconds: 3)), DesktopClient.closedFailed);
+    expect(Link.desktop.info.value, isNull);
+
+    // Another phone has it.
+    File("$stateDir/desktop-busy").writeAsStringSync("");
+    try {
+      await expectLater(Link.desktop.open(width: 1080, height: 2400, scale: 1.75), throwsA(isA<LinkRemoteException>().having((error) => error.code, "code", LinkErrorCode.busy)));
+    } finally {
+      File("$stateDir/desktop-busy").deleteSync();
+    }
+
+    // A reconnect inside the grace period finds the desktop as it was.
+    await Link.desktop.open(width: 1080, height: 2400, scale: 1.75);
+    await debug("debug.drop");
+    await waitFor(Link.connectionStatus, (status) => status.state != LinkState.ready, what: "drop");
+    expect(Link.desktop.info.value, isNull);
+    await waitState(LinkState.ready, timeout: const Duration(seconds: 6));
+    expect((await Link.desktop.open(width: 1080, height: 2400, scale: 1.75)).created, isFalse);
+
+    // Leaving: desktop.close, idempotent.
+    await Link.desktop.close();
+    await Link.desktop.close();
+    expect(Link.desktop.info.value, isNull);
+    expect(((await debug("debug.stats"))["desktop"] as Map)["closes"], 2);
+  }, skip: skip);
+
   test("the desktop's theme and wallpaper arrive, change, and persist", () async {
     final hostId = info["hostId"] as String;
     await waitFor(Link.theme.theme, (theme) => theme.name == "fakeix", what: "theme.changed");

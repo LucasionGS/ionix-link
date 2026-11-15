@@ -7,10 +7,11 @@ Phone companion for the Ionix desktop. The wire contract is `PROTOCOL.md`; this 
 ```
 bin/ionix-link                 Desktop daemon + CLI, one stdlib-only Python 3 file, executable
 systemd/ionix-link.service     User unit, graphical-session.target, Restart=on-failure
+udev/70-ionix-link-uinput.rules  Gives the seat's user /dev/uinput, for the phone desktop's touchscreen
 PROTOCOL.md                    Wire spec (framing, handshake, every message, files, control socket)
 STRUCTURE.md                   This file
 README.md                      For users
-Makefile                       Installs the desktop side (daemon, unit, licence)
+Makefile                       Installs the desktop side (daemon, unit, udev rule, licence)
 PKGBUILD, packaging/aur/       ionix-link-git, same scheme as ionix-quickshell (r<count>.<hash>)
 assets/ionix-logo.svg          The Ionix logo (copy of ionix-iso's system/assets), source of the app icons
 scripts/make-app-icons.sh      Renders the launcher icons and splash PNGs into app/android/.../res (needs rsvg-convert)
@@ -27,7 +28,8 @@ app/                           Flutter app (android + linux), package ionix_link
                                link_status.dart, discovery.dart (UDP), pairing.dart (QR and code flows)
     store/link_store.dart      link.json + flutter_secure_storage keys
     plugins/                   plugin_client.dart (base) + one <name>_client.dart per plugin, models inside;
-                               (share_client.dart: text, and chunked file uploads with progress/cancel)
+                               (share_client.dart: text, and chunked file uploads with progress/cancel;
+                               desktop_client.dart: open/close/resize, touch sets, commits, nav, textInput)
                                h264.dart (Annex-B helpers for the screen view's video)
   lib/platform/                Layer 3: OS glue behind `LinkPlatform`
     link_platform.dart         Interface + PlatformDevice
@@ -43,7 +45,11 @@ app/                           Flutter app (android + linux), package ionix_link
     sources.dart               UiSources: where pages get their data (Link by default, fakes in the preview)
     preview/                   preview_main.dart + fakes: every page with fake data, for headless screenshots
     plugin_pages.dart          Registry of dashboard tiles → pages
-    pages/                     home, media, commands, clipboard, input, screen, notifications, settings
+    pages/                     home, media, commands, clipboard, input, screen, notifications, settings, desktop
+                               (desktop_page: the phone desktop, full screen, built from pages/desktop/)
+    pages/desktop/             desktop_session (open, stream, reconnect; no widgets), touch_tracker (pointers →
+                               desktop.touch sets, coalesced), desktop_keyboard (the text field behind the
+                               phone's keyboard → desktop.commit), desktop_controls (back/home/overview, keyboard)
     pages/pair/                pair_page (start + nearby), qr_scan_page, code_confirm_page
     pages/share/               share_session (what a share does, no widgets), share_sheet (the "Send to <desktop>" sheet)
     widgets/                   adaptive_scaffold (one pane / two panes on the hinge / tabletop), backdrop,
@@ -99,7 +105,7 @@ Every protocol change lands in `PROTOCOL.md` in the same commit. A breaking one 
 
 ```json
 { "name": "", "discovery": true,
-  "plugins": { "screen": false },
+  "plugins": { "screen": false, "desktop": false },
   "notifications": { "ignoreApps": ["Spotify"] } }
 ```
 
@@ -116,7 +122,11 @@ Every protocol change lands in `PROTOCOL.md` in the same commit. A breaking one 
 
 `exec` as a list is argv; as a string it runs under `sh -c`. `timeout` defaults to 10 s. A user entry with a built-in's id replaces it; `"hidden": true` removes it.
 
-Environment overrides (daemon): `IONIX_LINK_PORT`, `IONIX_LINK_BIND`, `IONIX_LINK_NAME`, `IONIX_LINK_DISCOVERY`, `IONIX_LINK_DATA_DIR`, `IONIX_LINK_STATE_DIR`, `IONIX_LINK_CONFIG_DIR`, `IONIX_LINK_DOWNLOAD_DIR` (where shared files land), `IONIX_LINK_SOCKET`, `IONIX_LINK_THEME_DIR`, `IONIX_LINK_THEME_NAME_FILE`, `IONIX_LINK_POWER_SUPPLY_DIR`, `IONIX_LINK_DEBUG`, `IONIX_LINK_BIN_<TOOL>`.
+`plugins.desktop` (default on) is the phone desktop (§8.11). Switched off while one is open, `reload` closes it.
+
+Environment overrides (daemon): `IONIX_LINK_PORT`, `IONIX_LINK_BIND`, `IONIX_LINK_NAME`, `IONIX_LINK_DISCOVERY`, `IONIX_LINK_DATA_DIR`, `IONIX_LINK_STATE_DIR`, `IONIX_LINK_CONFIG_DIR`, `IONIX_LINK_DOWNLOAD_DIR` (where shared files land), `IONIX_LINK_SOCKET`, `IONIX_LINK_THEME_DIR`, `IONIX_LINK_THEME_NAME_FILE`, `IONIX_LINK_POWER_SUPPLY_DIR`, `IONIX_LINK_UINPUT` (where the phone desktop's touch device is made), `IONIX_LINK_TOUCH_NAME` (that device's name; a test sets its own so it can never find a real daemon's), `IONIX_LINK_HYPR_EVENTS` (Hyprland's socket2), `IONIX_LINK_H264_ENCODER`, `IONIX_LINK_DEBUG`, `IONIX_LINK_BIN_<TOOL>`.
+
+The phone desktop (`DesktopPlugin`) only ever talks to Hyprland through `hyprctl` (`eval` for rules, monitors, devices and dispatchers) and its socket2, so a fake `hyprctl` that keeps a JSON state and logs its argv, plus `IONIX_LINK_HYPR_EVENTS` at a socket of the test's own, tests it without a session. Its keyboard is `InputMethod` and its lock state `LockWatch`, `WaylandClient`s like `VirtualPointer`; point `WAYLAND_DISPLAY` at a fake compositor offering `zwp_input_method_manager_v2` and `hyprland_lock_notifier_v1`. A real `/dev/uinput` device is safe to test with once the reader holds `EVIOCGRAB` on its event node, before any touch is sent, and only if `IONIX_LINK_TOUCH_NAME` gives it a name of the test's own: the user's running daemon has a device called `Ionix Link Touch` too. Wait for udev to give a new event node its permissions before opening it.
 
 ## Pub packages (main session adds them; `flutter pub add <name>`)
 
@@ -167,7 +177,7 @@ inside `<application>`:
 
 ## Packaging and the ISO (later)
 
-`PKGBUILD` (working tree, for the ISO) and `packaging/aur/PKGBUILD` (`ionix-link-git`), installing `bin/ionix-link` → `/usr/bin`, `systemd/ionix-link.service` → `/usr/lib/systemd/user/`. Depends: `python`, `openssl`, `systemd`. Optdepends: `qrencode`, `playerctl`, `wireplumber`, `libpulse` (pactl), `wl-clipboard`, `wtype`, `grim`, `wf-recorder`, `libnotify`, `hyprland`, `wlr-randr`. In ionix-iso: `LOCAL_PACKAGES` in `aur/build-aur.sh`, a `packages.x86_64` line, and enabling the unit through a skel `graphical-session.target.wants` link for new accounts only; accounts that existed before enable it themselves.
+`PKGBUILD` (working tree, for the ISO) and `packaging/aur/PKGBUILD` (`ionix-link-git`), installing `bin/ionix-link` → `/usr/bin`, `systemd/ionix-link.service` → `/usr/lib/systemd/user/`, `udev/70-ionix-link-uinput.rules` → `/usr/lib/udev/rules.d/`. Depends: `python`, `openssl`, `systemd`. Optdepends: `qrencode`, `playerctl`, `wireplumber`, `libpulse` (pactl), `wl-clipboard`, `wtype`, `grim`, `wf-recorder`, `libnotify`, `hyprland`, `wlr-randr`, `awww`. In ionix-iso: `LOCAL_PACKAGES` in `aur/build-aur.sh`, a `packages.x86_64` line, and enabling the unit through a skel `graphical-session.target.wants` link for new accounts only; accounts that existed before enable it themselves.
 
 ## Work split
 

@@ -18,6 +18,7 @@ Your phone, on speaking terms with your Ionix desktop. Pair once, then read the 
 - **Clipboard**: send the phone's clipboard to the desktop, or fetch the desktop's.
 - **Touchpad and keyboard**: one finger moves, tap clicks, two fingers scroll, and there is a keyboard for when the real one is too far away.
 - **Screen view**: see a monitor on the phone and tap to click.
+- **Phone desktop**: a monitor of the phone's very own, sized to fit it. Open apps on it, touch them with real multitouch, type with the phone's keyboard, and watch it at full resolution and 60 fps. Close it and its windows come back to your main monitor. Needs Hyprland.
 - **Share to the desktop**: pick Ionix Link in any app's share menu. Links open on the desktop, text lands on its clipboard, and photos, videos and other files go to its Downloads folder.
 - **Foldables**: one pane when folded, two panes split on the hinge when open, and picture-on-top, controls-below when half open on a table. Folding never loses your place.
 - **Local and private**: everything stays on your network, encrypted, with no account and no cloud.
@@ -49,6 +50,7 @@ flutter build apk
 - `ionix-link ring <DEVICE>`: make a phone ring, for when it is somewhere in the sofa.
 - `ionix-link send-clipboard [DEVICE] [TEXT]`: send text, or the desktop's clipboard, to a phone.
 - `ionix-link commands`: list what phones are allowed to run.
+- `ionix-link desktop [close]`: show the phone desktop, or close it from the desktop side.
 
 ## Your own commands
 
@@ -65,6 +67,8 @@ flutter build apk
 `exec` as a list is run as is; as a string it runs under `sh -c`. `"confirm": true` makes the phone ask first. An entry with a built-in's id changes it, and `"hidden": true` removes it.
 
 `~/.config/ionix/link/config.json` holds the rest, all optional: `name` (what phones see), `discovery` (answer phones looking for desktops), `plugins` (switch a feature off, for example `{ "screen": false }`) and `notifications.ignoreApps`.
+
+The phone desktop's touchscreen needs `/dev/uinput`. The package's udev rule gives it to whoever is logged in at the seat; log in again after installing it, or the device is still root's. Know what that rule allows: any program you run can then create input devices, a keyboard or mouse included, and so type and click as you (the same rule Steam ships for its controllers). Without the rule the phone desktop still opens, but without touch. To turn it off, mask it (an upgrade would bring back a deleted copy) and log in again: `sudo ln -s /dev/null /etc/udev/rules.d/70-ionix-link-uinput.rules`.
 
 ## Technical bits
 

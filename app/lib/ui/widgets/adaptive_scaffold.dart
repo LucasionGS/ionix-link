@@ -1,6 +1,7 @@
 import "package:material_ui/material_ui.dart";
 
 import "../../link/link.dart";
+import "../pages/desktop/desktop_session.dart";
 import "../pages/home_page.dart";
 import "../pages/settings_page.dart";
 import "../plugin_pages.dart";
@@ -48,6 +49,14 @@ class ShellController extends ChangeNotifier {
   /// Whether the open page has taken over the whole window (the screen viewer). Lives here, with the selection,
   /// so a fold or unfold keeps it.
   bool get fullscreen => _fullscreen;
+
+  /// The Phone desktop that is running, if any. It lives here for the same reason [fullscreen] does: a fold or unfold
+  /// rebuilds the page in another place of the tree, and the desktop must not notice.
+  DesktopSession? desktopSession;
+
+  /// Set by a page that takes the system's back for itself (the Phone desktop sends it to the desktop). While set,
+  /// back calls it instead of leaving full screen or closing the page.
+  VoidCallback? backHandler;
 
   void setFullscreen(bool value) {
     if (_fullscreen == value) return;
@@ -168,10 +177,13 @@ class _AppShellState extends State<AppShell> {
           // Back leaves full screen first, then (on a single pane) closes the open page.
           final closesPage = !layout.isTwoPane && plugin != null;
           return PopScope(
-            canPop: !controller.fullscreen && !closesPage,
+            canPop: controller.backHandler == null && !controller.fullscreen && !closesPage,
             onPopInvokedWithResult: (didPop, _) {
               if (didPop) return;
-              if (controller.fullscreen) {
+              if (controller.backHandler != null) {
+                controller.backHandler!();
+              }
+              else if (controller.fullscreen) {
                 controller.setFullscreen(false);
               }
               else {

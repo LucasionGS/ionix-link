@@ -9,6 +9,7 @@ import "dart:typed_data";
 import "package:flutter_test/flutter_test.dart";
 import "package:ionix_link/link/models/link_theme.dart";
 import "package:ionix_link/link/models/pairing_uri.dart";
+import "package:ionix_link/link/plugins/desktop_client.dart";
 import "package:ionix_link/link/protocol/constants.dart";
 import "package:ionix_link/link/protocol/errors.dart";
 import "package:ionix_link/link/protocol/frame_codec.dart";
@@ -255,6 +256,31 @@ void main() {
       expect(theme.flat, isTrue);
       expect(LinkTheme.fromJson(theme.toJson()), theme);
       expect(LinkTheme.fromJson(const {}), LinkTheme.ionix);
+    });
+  });
+
+  group("desktop commit splitting", () {
+    int bytes(String s) => utf8.encode(s).length;
+
+    test("text that fits goes as one commit", () {
+      expect(DesktopClient.splitCommit("héllo"), ["héllo"]);
+      expect(DesktopClient.splitCommit("a" * 100, maxBytes: 100), ["a" * 100]);
+    });
+
+    test("the limit is UTF-8 bytes, not UTF-16 units, and a piece is never cut inside a code point", () {
+      // 30000 three-byte characters are 30000 UTF-16 units but 90000 bytes: over the 64 KiB limit.
+      final text = "漢" * 30000;
+      final parts = DesktopClient.splitCommit(text);
+      expect(parts.length, 2);
+      expect(parts.join(), text);
+      for (final part in parts) {
+        expect(bytes(part), lessThanOrEqualTo(64 * 1024));
+      }
+      // Four-byte code points are two UTF-16 units and must stay whole.
+      final emoji = "😀" * 10;
+      final pieces = DesktopClient.splitCommit(emoji, maxBytes: 10);
+      expect(pieces, ["😀😀", "😀😀", "😀😀", "😀😀", "😀😀"]);
+      expect(pieces.join(), emoji);
     });
   });
 }

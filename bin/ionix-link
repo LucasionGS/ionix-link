@@ -20,9 +20,11 @@ so the phone never shows a tile that cannot work. Adding a plugin means one
 Nothing here talks to a desktop service through a library. It shells out:
 busctl (notifications), playerctl, wpctl/pactl (media), wl-copy/wl-paste,
 wtype, grim, hyprctl or wlr-randr, notify-send, xdg-open, qrencode, awww, magick or
-ffmpeg, and openssl. The one exception is the pointer: a small Wayland client
+ffmpeg, and openssl. The exceptions are input: a small Wayland client
 speaking zwlr_virtual_pointer_v1 over the compositor socket, because no CLI
-tool moves a pointer relatively at touchpad rates without a process per event.
+tool moves a pointer relatively at touchpad rates without a process per event;
+the same client as zwp_input_method_v2 for the phone desktop's keyboard; and
+a uinput touchscreen for that desktop, for the same reason as the pointer.
 
 Files (§10; every path has an environment override for testing in a scratch dir):
 
@@ -41,6 +43,7 @@ import asyncio
 import collections
 import copy
 import errno
+import fcntl
 import glob
 import hashlib
 import hmac
@@ -116,10 +119,23 @@ SCREEN_VIDEO_LAG = 0.3             # s of frames (at maxFps, at least 6) sent bu
 SCREEN_VIDEO_FLUSH = 0.003         # s of silence from the encoder that ends the access unit it is writing
 SCREEN_VIDEO_FIRST = 5             # s an encoder may take to write its first access unit
 SCREEN_VIDEO_BPP = 0.002           # default bitrate: bits per pixel per frame for each point of `quality`
-H264_ENCODERS = ("h264_vaapi", "h264_nvenc", "libx264")   # tried in this order; one that fails is skipped
+H264_ENCODERS = ("h264_vaapi", "h264_nvenc", "libx264")   # the ones there are; _encoders() orders them, skips failures
 H264_RETRY = 600                   # s a hardware encoder that wrote no frame is left out before it is tried again
 H264_DEMOTE_AFTER = 3              # runs in a row without a frame that demote a hardware encoder that once worked
 VAAPI_DEVICE = "/dev/dri/renderD128"
+SCREEN_SCALE_MAX = 4.0             # screen.start `scale` with cap hires; a frame never exceeds the output's pixels
+SCREEN_FPS_MAX = 60                # screen.start `maxFps` with cap hires
+DESKTOP_OUTPUT = "IONIX-LINK-1"    # the phone's own monitor (§8.11) ...
+DESKTOP_PREFIX = "IONIX-LINK-"     # ... and what marks one, ours or a dead daemon's
+DESKTOP_GRACE = 30                 # s a disconnected phone keeps its desktop
+DESKTOP_GAP = 8000                 # logical px between the phone's monitor and every real one, both ways
+DESKTOP_TOUCH_NAME = "Ionix Link Touch"   # the uinput device's name, unless IONIX_LINK_TOUCH_NAME says otherwise
+DESKTOP_TOUCH_MAX = 32767          # ABS_MT_POSITION_X/Y range, fixed whatever the output's size
+DESKTOP_TOUCH_SLOTS = 10
+DESKTOP_PROBE_TTL = 30             # s the ime and nav probes are believed
+DESKTOP_WAIT = 3                   # s for a new monitor or input device to show up in hyprctl
+DESKTOP_COMMIT_MAX = 64 * 1024     # bytes of desktop.commit text
+DESKTOP_DELETE_MAX = 1024          # desktop.commit deleteBefore, code points
 THEME_POLL = 2                     # s between theme file checks
 ART_FETCH_MAX = 16 * 1024 * 1024   # bytes of cover art read from a file or URL before giving up
 ART_FETCH_TIMEOUT = 5              # s per socket operation of an http(s) cover download ...
@@ -154,6 +170,7 @@ ERR_TIMEOUT = "timeout"
 ERR_FAILED = "failed"
 ERR_INTERNAL = "internal"
 ERR_SHUTDOWN = "shutdown"
+ERR_UNAVAILABLE = "unavailable"
 FATAL_ERRORS = {
     ERR_BAD_FRAME, ERR_TOO_LARGE, ERR_BAD_JSON, ERR_NOT_AUTHENTICATED, ERR_PROTOCOL_VERSION,
     ERR_UNKNOWN_DEVICE, ERR_AUTH_FAILED, ERR_RATE_LIMITED, ERR_REPLACED, ERR_SHUTDOWN,
@@ -187,7 +204,8 @@ CORE_TYPES = {T_HELLO, T_CHALLENGE, T_AUTH, T_READY, T_ERROR, T_PING, T_PONG, T_
               T_PAIR_CONFIRM, T_PAIR_PENDING, T_PAIR_ACCEPT, T_PAIR_REJECT, T_PAIR_UNPAIR}
 # The phone's plugin messages that are pushes (§8); any other plugin type without an `id` is ignored (§2).
 PUSH_TYPES = {"input.move", "input.moveAbsolute", "input.button", "input.scroll", "screen.ack", "status.battery",
-              "notifications.phonePosted", "notifications.phoneRemoved"}
+              "notifications.phonePosted", "notifications.phoneRemoved", "desktop.touch", "desktop.commit",
+              "desktop.nav"}
 
 # CLI exit codes
 EXIT_OK = 0
@@ -205,7 +223,7 @@ DEFAULT_CONFIG = {
     # Per-plugin switch; a plugin set false is never offered.
     "plugins": {
         "notifications": True, "media": True, "commands": True, "clipboard": True,
-        "input": True, "screen": True, "status": True, "theme": True, "share": True,
+        "input": True, "screen": True, "status": True, "theme": True, "share": True, "desktop": True,
     },
     "notifications": {
         # app_name values never forwarded (case-insensitive).
@@ -230,8 +248,9 @@ VIRTUAL_IFACES = ("docker", "br-", "veth", "virbr", "vnet", "vmnet", "cni", "fla
 #   IONIX_LINK_PORT, IONIX_LINK_BIND, IONIX_LINK_NAME, IONIX_LINK_DISCOVERY (0/1),
 #   IONIX_LINK_DATA_DIR, IONIX_LINK_STATE_DIR, IONIX_LINK_CONFIG_DIR, IONIX_LINK_DOWNLOAD_DIR, IONIX_LINK_SOCKET,
 #   IONIX_LINK_THEME_DIR, IONIX_LINK_THEME_NAME_FILE, IONIX_LINK_POWER_SUPPLY_DIR,
-#   IONIX_LINK_DEBUG (1 = verbose log), and IONIX_LINK_BIN_<TOOL> for any tool
-#   (IONIX_LINK_BIN_GRIM=/path/to/fake-grim), resolved by tool().
+#   IONIX_LINK_UINPUT, IONIX_LINK_TOUCH_NAME (the phone desktop's touch device, so a test never finds the real one),
+#   IONIX_LINK_HYPR_EVENTS (Hyprland's socket2), IONIX_LINK_DEBUG (1 = verbose log), and IONIX_LINK_BIN_<TOOL> for any
+#   tool (IONIX_LINK_BIN_GRIM=/path/to/fake-grim), resolved by tool().
 
 
 def xdg(var, fallback):
@@ -283,6 +302,25 @@ class Paths:
         self.theme_dir = env.get("IONIX_LINK_THEME_DIR") or os.path.join(config_home, "quickshell", "ionix")
         self.theme_name_file = env.get("IONIX_LINK_THEME_NAME_FILE") or os.path.join(config_home, "ionix", "current-theme")
         self.power_supply_dir = env.get("IONIX_LINK_POWER_SUPPLY_DIR") or "/sys/class/power_supply"
+
+        # The phone desktop (§8.11): where touch devices are made, and Hyprland's event socket.
+        self.uinput = env.get("IONIX_LINK_UINPUT") or "/dev/uinput"
+        self.touch_name = env.get("IONIX_LINK_TOUCH_NAME") or DESKTOP_TOUCH_NAME
+        if len(self.touch_name.encode("utf-8")) > 79 or not self.touch_name.isprintable():
+            raise LinkError(CERR_BAD_REQUEST, "IONIX_LINK_TOUCH_NAME must be printable and at most 79 bytes long.")
+        # What Hyprland calls that device in `hyprctl devices` and hl.device: lower case, spaces as dashes.
+        self.touch_device = self.touch_name.lower().replace(" ", "-")
+        self.hypr_events = env.get("IONIX_LINK_HYPR_EVENTS") or None
+
+    def hyprland_events(self):
+        """Hyprland's event socket (socket2) of the session this daemon runs in, or None outside one."""
+        if self.hypr_events:
+            return self.hypr_events
+        signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+        if not signature or not runtime:
+            return None
+        return os.path.join(runtime, "hypr", signature, ".socket2.sock")
 
 
 def tool(name):
@@ -3258,42 +3296,34 @@ def truncate_utf8(raw, limit):
 
 
 class _WaylandProtocol(asyncio.Protocol):
-    def __init__(self, pointer):
-        self.pointer = pointer
+    def __init__(self, client):
+        self.client = client
 
     def data_received(self, data):
-        self.pointer._on_data(data)
+        self.client._on_data(data)
 
     def connection_lost(self, exc):
-        self.pointer._on_lost(exc)
+        self.client._on_lost(exc)
 
 
-class VirtualPointer:
-    """Minimal Wayland client: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY, binds wl_seat and
-    zwlr_virtual_pointer_manager_v1, creates one zwlr_virtual_pointer_v1 and keeps it for the daemon's life
-    (one long-lived device; a device per event loses button events).
+class WaylandClient:
+    """Minimal Wayland client over $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY: the registry, roundtrips and the wire format,
+    with what it binds left to a subclass (`_setup`, `_event`).
 
     Wire format (native byte order, little-endian on every target): header = u32 object id, u32 (size << 16 |
     opcode); args are u32/i32, fixed = i32 of value*256, string = u32 length incl. NUL + bytes padded to 4,
-    new_id for wl_registry.bind = string interface, u32 version, u32 id. Opcodes, checked against
-    wlr-virtual-pointer-unstable-v1.xml (version 2) and wayland.xml:
+    new_id for wl_registry.bind = string interface, u32 version, u32 id. Opcodes, from wayland.xml:
       wl_display:   req 0 sync(new_id), 1 get_registry(new_id); ev 0 error(obj, u32, str), 1 delete_id(u32)
       wl_registry:  req 0 bind(u32 name, new_id); ev 0 global(u32 name, str iface, u32 version), 1 global_remove
       wl_callback:  ev 0 done(u32)
-      manager v1/2: req 0 create_virtual_pointer(obj seat|0, new_id), 1 destroy, 2 create_virtual_pointer_with_output (v2)
-      pointer:      req 0 motion(u32 time, fixed dx, fixed dy), 1 motion_absolute(u32 time, u32 x, u32 y,
-                    u32 x_extent, u32 y_extent), 2 button(u32 time, u32 button, u32 state), 3 axis(u32 time,
-                    u32 axis, fixed value), 4 frame, 5 axis_source(u32), 6 axis_stop(u32 time, u32 axis),
-                    7 axis_discrete(...), 8 destroy
-    Buttons BTN_LEFT 0x110, BTN_RIGHT 0x111, BTN_MIDDLE 0x112; state 1 pressed / 0 released; axis 0 vertical,
-    1 horizontal; axis_source finger = 1. Every event group ends with `frame`. Absolute moves use the bounding
-    box of all outputs (from ScreenPlugin.outputs) as the extent. Reconnects lazily if the compositor restarts.
     """
 
-    BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
-    AXIS_SOURCE_FINGER = 1
-    SCROLL_STOP = 0.15             # s without scrolling → axis_stop, which ends kinetic scrolling cleanly
-    RETRY = 30                     # s after a failed connect before available() offers the pointer again
+    LABEL = "Wayland client"
+    LOST_HINT = ""                 # appended to the "connection lost" log line
+    RETRY = 30                     # s after a failed connect before may_connect() says yes again
+    # Bytes in one message. libwayland reads into a 4 KiB buffer and drops a client whose message does not fit in
+    # it, and the header's size field is 16 bits.
+    MAX_MESSAGE = 4096
 
     def __init__(self):
         self.ready = False
@@ -3304,9 +3334,6 @@ class VirtualPointer:
         self._registry = None
         self._globals = {}         # interface → (name, version)
         self._callbacks = {}       # wl_callback id → Future
-        self._pointer = None
-        self._scrolling = set()
-        self._scroll_timer = None
         self._connecting = None
 
     def socket_path(self):
@@ -3326,7 +3353,7 @@ class VirtualPointer:
         return self.failed_at is None or time.monotonic() - self.failed_at > self.RETRY
 
     async def connect(self):
-        """Connect and bind; returns False (and stays unavailable) when the global is missing."""
+        """Connect and bind; returns False (and stays unavailable) when a global is missing."""
         if self.ready:
             return True
         if self._connecting is not None:
@@ -3335,7 +3362,7 @@ class VirtualPointer:
         try:
             ok = await self._connect()
         except Exception:
-            log(f"Virtual pointer: connect failed:\n{traceback.format_exc()}")
+            log(f"{self.LABEL}: connect failed:\n{traceback.format_exc()}")
             ok = False
         if not ok:
             self.failed_at = time.monotonic()
@@ -3347,14 +3374,14 @@ class VirtualPointer:
     async def _connect(self):
         path = self.socket_path()
         if not path or not os.path.exists(path):
-            log("Virtual pointer: no Wayland socket (WAYLAND_DISPLAY); the pointer is unavailable.", debug=True)
+            log(f"{self.LABEL}: no Wayland socket (WAYLAND_DISPLAY); it is unavailable.", debug=True)
             return False
         loop = asyncio.get_running_loop()
         try:
             self.transport, _ = await asyncio.wait_for(
                 loop.create_unix_connection(lambda: _WaylandProtocol(self), path), 3)
         except (OSError, TimeoutError) as e:
-            log(f"Virtual pointer: cannot connect to {path}: {e}.")
+            log(f"{self.LABEL}: cannot connect to {path}: {e}.")
             return False
         self._buf.clear()
         self._next_id = 2
@@ -3363,29 +3390,18 @@ class VirtualPointer:
         self._registry = self._new_id()
         self._send(1, 1, struct.pack("=I", self._registry))
         await self._roundtrip()
-        manager = self._globals.get("zwlr_virtual_pointer_manager_v1")
-        if manager is None:
-            log("Virtual pointer: the compositor has no zwlr_virtual_pointer_manager_v1; the pointer is unavailable.")
-            return False
-        seat_id = 0
-        seat = self._globals.get("wl_seat")
-        if seat is not None:
-            seat_id = self._bind(seat[0], "wl_seat", 1)
-        manager_id = self._bind(manager[0], "zwlr_virtual_pointer_manager_v1", 1)
-        self._pointer = self._new_id()
-        self._send(manager_id, 0, struct.pack("=II", seat_id, self._pointer))
-        await self._roundtrip()    # a protocol error arrives before this callback's done
-        if self.transport is None:
+        if self.transport is None or not await self._setup():
             return False
         self.ready = True
-        log("Virtual pointer ready.", debug=True)
+        log(f"{self.LABEL} ready.", debug=True)
+        return True
+
+    async def _setup(self):
+        """Bind what the subclass needs from `_globals`; False if the compositor lacks it."""
         return True
 
     def close(self):
         self.ready = False
-        if self._scroll_timer is not None:
-            self._scroll_timer.cancel()
-            self._scroll_timer = None
         if self.transport is not None:
             transport, self.transport = self.transport, None
             transport.close()
@@ -3401,10 +3417,15 @@ class VirtualPointer:
         return struct.pack("=I", len(raw)) + raw + b"\0" * (-len(raw) % 4)
 
     def _send(self, obj, opcode, payload=b""):
+        """Write one message; False (and nothing written) when it is not connected or the message is too big."""
         if self.transport is None:
-            return
+            return False
         size = 8 + len(payload)
+        if size > self.MAX_MESSAGE:
+            log(f"{self.LABEL}: a {size}-byte message (opcode {opcode}) is over Wayland's {self.MAX_MESSAGE}; not sent.")
+            return False
         self.transport.write(struct.pack("=II", obj, (size << 16) | opcode) + payload)
+        return True
 
     def _bind(self, name, interface, version):
         oid = self._new_id()
@@ -3429,7 +3450,7 @@ class VirtualPointer:
             obj, word = struct.unpack_from("=II", self._buf)
             size, opcode = word >> 16, word & 0xFFFF
             if size < 8:
-                log("Virtual pointer: malformed message from the compositor.")
+                log(f"{self.LABEL}: malformed message from the compositor.")
                 self.close()
                 return
             if len(self._buf) < size:
@@ -3448,7 +3469,7 @@ class VirtualPointer:
         if obj == 1 and opcode == 0:
             bad, code = struct.unpack_from("=II", args)
             text, _ = self._read_string(args, 8)
-            log(f"Virtual pointer: Wayland error on object {bad} (code {code}): {text}")
+            log(f"{self.LABEL}: Wayland error on object {bad} (code {code}): {text}")
             self.close()
             for fut in self._callbacks.values():
                 if not fut.done():
@@ -3462,10 +3483,15 @@ class VirtualPointer:
             fut = self._callbacks[obj]
             if not fut.done():
                 fut.set_result(True)
+        elif obj != 1:
+            self._event(obj, opcode, args)
+
+    def _event(self, obj, opcode, args):
+        """An event for an object the subclass made."""
 
     def _on_lost(self, exc):
         if self.ready:
-            log("Virtual pointer: compositor connection lost; it reconnects on the next input.")
+            log(f"{self.LABEL}: compositor connection lost{self.LOST_HINT}.")
         self.ready = False
         self.transport = None
         self.failed_at = None
@@ -3480,6 +3506,124 @@ class VirtualPointer:
     @staticmethod
     def _fixed(v):
         return max(-0x80000000, min(0x7FFFFFFF, int(round(v * 256))))
+
+
+class WaylandProbe(WaylandClient):
+    """Connects, reads the registry and binds nothing: whether the compositor offers every one of `interfaces`."""
+
+    LABEL = "Wayland probe"
+
+    def __init__(self, *interfaces):
+        super().__init__()
+        self.interfaces = interfaces
+
+    async def _setup(self):
+        return all(i in self._globals for i in self.interfaces)
+
+    async def offered(self):
+        if not self.may_connect():
+            return False
+        ok = await self.connect()
+        self.close()
+        return ok
+
+
+class LockWatch(WaylandClient):
+    """Whether the session is locked, from hyprland_lock_notifier_v1 (what hypridle uses), followed while a phone
+    desktop is open so a window that opens under the lock screen is never moved (§8.11).
+
+    Opcodes, checked against hyprland-lock-notify-v1.xml (version 1):
+      notifier:     req 0 destroy, 1 get_lock_notification(new_id)
+      notification: req 0 destroy; ev 0 locked, 1 unlocked
+    Hyprland sends `locked` to a new notification object at once when the session already is, and `locked` only
+    once the lock screen has drawn on every output, so a lock that is still starting reads as unlocked. Without the
+    protocol (another compositor, an old Hyprland) `locked` stays False.
+    """
+
+    LABEL = "Lock watch"
+
+    def __init__(self):
+        super().__init__()
+        self.locked = False
+        self._notification = None
+
+    async def _setup(self):
+        notifier = self._globals.get("hyprland_lock_notifier_v1")
+        if notifier is None:
+            log("Lock watch: the compositor has no hyprland_lock_notifier_v1; windows are claimed even when locked.",
+                debug=True)
+            return False
+        notifier_id = self._bind(notifier[0], "hyprland_lock_notifier_v1", 1)
+        self._notification = self._new_id()
+        self.locked = False
+        self._send(notifier_id, 1, struct.pack("=I", self._notification))
+        await self._roundtrip()    # an already locked session says so before this callback's done
+        return self.transport is not None
+
+    def _event(self, obj, opcode, args):
+        if obj == self._notification and opcode in (0, 1):
+            self.locked = opcode == 0
+
+    def close(self):
+        if self.transport is not None and self._notification is not None:
+            self._send(self._notification, 0)
+        self._notification = None
+        self.locked = False
+        super().close()
+
+    def _on_lost(self, exc):
+        self._notification = None
+        self.locked = False
+        super()._on_lost(exc)
+
+
+class VirtualPointer(WaylandClient):
+    """Binds wl_seat and zwlr_virtual_pointer_manager_v1, creates one zwlr_virtual_pointer_v1 and keeps it for the
+    daemon's life (one long-lived device; a device per event loses button events).
+
+    Opcodes, checked against wlr-virtual-pointer-unstable-v1.xml (version 2):
+      manager v1/2: req 0 create_virtual_pointer(obj seat|0, new_id), 1 destroy, 2 create_virtual_pointer_with_output (v2)
+      pointer:      req 0 motion(u32 time, fixed dx, fixed dy), 1 motion_absolute(u32 time, u32 x, u32 y,
+                    u32 x_extent, u32 y_extent), 2 button(u32 time, u32 button, u32 state), 3 axis(u32 time,
+                    u32 axis, fixed value), 4 frame, 5 axis_source(u32), 6 axis_stop(u32 time, u32 axis),
+                    7 axis_discrete(...), 8 destroy
+    Buttons BTN_LEFT 0x110, BTN_RIGHT 0x111, BTN_MIDDLE 0x112; state 1 pressed / 0 released; axis 0 vertical,
+    1 horizontal; axis_source finger = 1. Every event group ends with `frame`. Absolute moves use the bounding
+    box of all outputs (from ScreenPlugin.outputs) as the extent. Reconnects lazily if the compositor restarts.
+    """
+
+    LABEL = "Virtual pointer"
+    LOST_HINT = "; it reconnects on the next input"
+    BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
+    AXIS_SOURCE_FINGER = 1
+    SCROLL_STOP = 0.15             # s without scrolling → axis_stop, which ends kinetic scrolling cleanly
+
+    def __init__(self):
+        super().__init__()
+        self._pointer = None
+        self._scrolling = set()
+        self._scroll_timer = None
+
+    async def _setup(self):
+        manager = self._globals.get("zwlr_virtual_pointer_manager_v1")
+        if manager is None:
+            log("Virtual pointer: the compositor has no zwlr_virtual_pointer_manager_v1; the pointer is unavailable.")
+            return False
+        seat_id = 0
+        seat = self._globals.get("wl_seat")
+        if seat is not None:
+            seat_id = self._bind(seat[0], "wl_seat", 1)
+        manager_id = self._bind(manager[0], "zwlr_virtual_pointer_manager_v1", 1)
+        self._pointer = self._new_id()
+        self._send(manager_id, 0, struct.pack("=II", seat_id, self._pointer))
+        await self._roundtrip()    # a protocol error arrives before this callback's done
+        return self.transport is not None
+
+    def close(self):
+        if self._scroll_timer is not None:
+            self._scroll_timer.cancel()
+            self._scroll_timer = None
+        super().close()
 
     def _frame(self):
         self._send(self._pointer, 4)
@@ -3528,6 +3672,162 @@ class VirtualPointer:
             self._send(self._pointer, 6, struct.pack("=II", t, axis))
         self._scrolling.clear()
         self._frame()
+
+
+class InputMethod(WaylandClient):
+    """The seat's input method (zwp_input_method_v2), held only while a phone desktop is open (§8.11): text from
+    the phone's keyboard goes in through it, and the text field focus it reports decides when the phone shows that
+    keyboard. It never grabs the keyboard, so physical keys keep going straight to the focused window.
+
+    Opcodes, checked against input-method-unstable-v2.xml (version 1):
+      manager:      req 0 get_input_method(obj seat, new_id), 1 destroy
+      input method: req 0 commit_string(str), 1 set_preedit_string(str, i32, i32), 2 delete_surrounding_text(u32
+                    before, u32 after; bytes), 3 commit(u32 serial), 4 get_input_popup_surface, 5 grab_keyboard,
+                    6 destroy; ev 0 activate, 1 deactivate, 2 surrounding_text(str, u32 cursor, u32 anchor; bytes),
+                    3 text_change_cause(u32), 4 content_type(u32 hint, u32 purpose), 5 done, 6 unavailable
+    Everything before `done` is pending and applies at `done`; `commit`'s serial is the number of `done`s seen.
+    `unavailable` means another input method holds the seat: this one is inert and is closed. Text goes in pieces
+    of at most PIECE bytes, each its own commit_string and commit, so no message outgrows MAX_MESSAGE.
+    """
+
+    LABEL = "Input method"
+    PIECE = 4000                   # bytes of text per commit_string: with its header and padding, under MAX_MESSAGE
+    # text-input-v3 content purposes → desktop.textInput's (§8.11)
+    PURPOSES = {0: "normal", 1: "normal", 2: "number", 3: "number", 4: "phone", 5: "url", 6: "email", 7: "normal",
+                8: "password", 9: "number", 10: "normal", 11: "normal", 12: "normal", 13: "terminal"}
+
+    def __init__(self, on_change=None, on_lost=None):
+        super().__init__()
+        self.on_change = on_change   # (active: bool, purpose: str) after a `done` that changed either
+        self.on_lost = on_lost       # () when the compositor dropped a ready connection
+        self.unavailable = False
+        self.active = False
+        self.purpose = "normal"
+        self._im = None
+        self._serial = 0
+        self._pending = {}
+        self._surrounding = None     # (text bytes, cursor byte offset) of the active text input, when it says
+
+    async def _setup(self):
+        manager = self._globals.get("zwp_input_method_manager_v2")
+        seat = self._globals.get("wl_seat")
+        if manager is None or seat is None:
+            log("Input method: the compositor has no zwp_input_method_manager_v2; the phone keyboard types with wtype.",
+                debug=True)
+            return False
+        seat_id = self._bind(seat[0], "wl_seat", 1)
+        manager_id = self._bind(manager[0], "zwp_input_method_manager_v2", 1)
+        self._im = self._new_id()
+        self._serial = 0
+        self._pending = {}
+        self.unavailable = False
+        self.active = False
+        self._send(manager_id, 0, struct.pack("=II", seat_id, self._im))
+        await self._roundtrip()    # `unavailable` arrives before this callback's done
+        if self.unavailable:
+            log("Input method: another input method holds the seat.", debug=True)
+            return False
+        return self.transport is not None
+
+    def close(self):
+        if self.transport is not None and self._im is not None:
+            self._send(self._im, 6)
+        self._im = None
+        was_active = self.active
+        self.active = False
+        self._surrounding = None
+        super().close()
+        if was_active and self.on_change is not None:
+            self.on_change(False, self.purpose)
+
+    def _on_lost(self, exc):
+        was_active, was_ready = self.active, self.ready
+        self.active = False
+        self._im = None
+        self._surrounding = None
+        super()._on_lost(exc)
+        if was_active and self.on_change is not None:
+            self.on_change(False, self.purpose)
+        if was_ready and self.on_lost is not None:
+            self.on_lost()
+
+    def _event(self, obj, opcode, args):
+        if obj != self._im:
+            return
+        if opcode == 0:
+            self._pending = {"active": True}
+        elif opcode == 1:
+            self._pending = {"active": False}
+        elif opcode == 2:
+            text, offset = self._read_string(args, 0)
+            cursor = struct.unpack_from("=I", args, offset)[0]
+            self._pending["surrounding"] = (text.encode("utf-8"), cursor)
+        elif opcode == 4:
+            self._pending["purpose"] = struct.unpack_from("=II", args)[1]
+        elif opcode == 5:
+            self._serial = (self._serial + 1) & 0xFFFFFFFF
+            self._apply(self._pending)
+            self._pending = {}
+        elif opcode == 6:
+            self.unavailable = True
+
+    def _apply(self, p):
+        before = (self.active, self.purpose)
+        if "active" in p:
+            self.active = p["active"]
+            # activate resets the text input's state; whatever follows it in the same batch is the new state.
+            self._surrounding = None
+            self.purpose = "normal"
+        if "surrounding" in p:
+            self._surrounding = p["surrounding"]
+        if "purpose" in p:
+            self.purpose = self.PURPOSES.get(p["purpose"], "normal")
+        if (self.active, self.purpose) != before and self.on_change is not None:
+            self.on_change(self.active, self.purpose)
+
+    def knows_surrounding(self):
+        return self._surrounding is not None
+
+    @classmethod
+    def pieces(cls, text):
+        """`text` cut into pieces of at most PIECE bytes of UTF-8, only ever between code points."""
+        raw = text.encode("utf-8")
+        out, start = [], 0
+        while start < len(raw):
+            end = min(start + cls.PIECE, len(raw))
+            while end < len(raw) and raw[end] & 0xC0 == 0x80:   # a continuation byte: back to where it starts
+                end -= 1
+            out.append(raw[start:end].decode("utf-8"))
+            start = end
+        return out
+
+    def commit(self, text, delete_before):
+        """Delete `delete_before` code points before the cursor, then insert `text`: the deletion with the first
+        piece, then one commit per piece. Needs the surrounding text to delete (deletion is in bytes on the wire).
+        Returns None when nothing was applied (no text input active, no connection), else the part of `text` that
+        could not be sent because the connection went half way ("" once all of it went), for the caller to type."""
+        if not self.ready or not self.active:
+            return None
+        pieces = self.pieces(text) if text else [""]
+        if delete_before and self._surrounding is not None:
+            raw, cursor = self._surrounding
+            head = raw[:cursor].decode("utf-8", "ignore")
+            gone = head[-delete_before:].encode("utf-8") if delete_before < len(head) else head.encode("utf-8")
+            if gone:
+                if not self._send(self._im, 2, struct.pack("=II", len(gone), 0)):
+                    return None
+                raw, cursor = raw[:cursor - len(gone)] + raw[cursor:], cursor - len(gone)
+            self._surrounding = (raw, cursor)
+        for i, piece in enumerate(pieces):
+            if piece and not self._send(self._im, 0, self._string(piece)):
+                return "".join(pieces[i:])
+            if not self._send(self._im, 3, struct.pack("=I", self._serial)):
+                return "".join(pieces[i:])         # a commit_string never committed is dropped with the connection
+            if piece and self._surrounding is not None:
+                raw, cursor = self._surrounding
+                added = piece.encode("utf-8")
+                self._surrounding = (raw[:cursor] + added + raw[cursor:], cursor + len(added))
+        return ""
 
 
 class InputPlugin(Plugin):
@@ -3773,6 +4073,8 @@ class _Stream:
         self.size = size           # (w, h) expected
         self.format = fmt          # "jpeg" | "h264"
         self.bitrate = bitrate     # bits/s, h264 only
+        self.native = False        # `size` is the output's own pixel size: capture and encode without scaling
+        self.capture_scale = scale # grim's -s: `scale`, or the output's own scale at native size
         self.seq = 0
         self.acked = asyncio.Event()
         self.acked.set()
@@ -3812,15 +4114,17 @@ class ScreenPlugin(Plugin):
         self._locks = {}           # conn → Lock around screen.start / screen.stop
         self._outputs = None
         self._outputs_at = 0.0
+        self._native = {}          # output name → (width, height) of its mode in pixels, as shown (transform applied)
         self._skipped = {}         # hardware encoder → monotonic time it is tried again (it wrote no frame)
         self._worked = set()       # encoders that have written a frame since the daemon started
         self._empty_runs = {}      # encoder → runs in a row that wrote no frame
 
     def caps(self):
-        return ["jpeg", "h264"] if tool("wf-recorder") and self._encoders() else ["jpeg"]
+        return (["jpeg", "h264"] if tool("wf-recorder") and self._encoders() else ["jpeg"]) + ["hires"]
 
     async def outputs(self, fresh=False):
-        """[{name, description, x, y, width, height, scale, focused}] in logical px."""
+        """[{name, description, x, y, width, height, scale, focused, virtual}] in logical px; `virtual` marks the
+        phone desktop's own monitors (§8.11), which the phone's ordinary screen picker leaves out."""
         if not fresh and self._outputs is not None and time.monotonic() - self._outputs_at < self.OUTPUTS_TTL:
             return self._outputs
         outputs = []
@@ -3845,15 +4149,21 @@ class ScreenPlugin(Plugin):
         w, h = round(width / scale), round(height / scale)
         return (h, w) if is_int(transform) and transform % 2 == 1 else (w, h)
 
+    def _remember_native(self, name, width, height, transform):
+        if is_int(width) and is_int(height) and width > 0 and height > 0:
+            self._native[name] = (height, width) if is_int(transform) and transform % 2 == 1 else (width, height)
+
     def _parse_hyprctl(self, monitors):
         outputs = []
         for m in monitors if isinstance(monitors, list) else []:
             if not isinstance(m, dict) or m.get("disabled") is True or not isinstance(m.get("name"), str):
                 continue
             w, h = self._logical(m.get("width", 0), m.get("height", 0), m.get("scale", 1), m.get("transform", 0))
+            self._remember_native(m["name"], m.get("width"), m.get("height"), m.get("transform", 0))
             outputs.append({"name": m["name"], "description": str(m.get("description", "")), "x": int(m.get("x", 0)),
                             "y": int(m.get("y", 0)), "width": w, "height": h,
-                            "scale": float(m.get("scale", 1) or 1), "focused": m.get("focused") is True})
+                            "scale": float(m.get("scale", 1) or 1), "focused": m.get("focused") is True,
+                            "virtual": m["name"].startswith(DESKTOP_PREFIX)})
         return outputs
 
     def _parse_wlr_randr(self, heads):
@@ -3866,10 +4176,12 @@ class ScreenPlugin(Plugin):
                 continue
             transform = {"90": 1, "270": 3, "flipped-90": 5, "flipped-270": 7}.get(str(o.get("transform")), 0)
             w, h = self._logical(mode.get("width", 0), mode.get("height", 0), o.get("scale", 1), transform)
+            self._remember_native(o["name"], mode.get("width"), mode.get("height"), transform)
             pos = o.get("position") or {}
             outputs.append({"name": o["name"], "description": str(o.get("description", "")), "x": int(pos.get("x", 0)),
                             "y": int(pos.get("y", 0)), "width": w, "height": h,
-                            "scale": float(o.get("scale", 1) or 1), "focused": False})
+                            "scale": float(o.get("scale", 1) or 1), "focused": False,
+                            "virtual": o["name"].startswith(DESKTOP_PREFIX)})
         return outputs
 
     async def handle(self, conn, msg, data):
@@ -3906,12 +4218,12 @@ class ScreenPlugin(Plugin):
         out = next((o for o in await self.outputs(fresh=True) if o["name"] == name), None)
         if out is None:
             raise LinkError(ERR_INVALID_ARGUMENT, f"No output named {name!r}; screen.outputs lists them.")
-        if not is_number(scale) or not 0.1 <= scale <= 1.0:
-            raise LinkError(ERR_INVALID_ARGUMENT, "\"scale\" must be from 0.1 to 1.0.")
+        if not is_number(scale) or not 0.1 <= scale <= SCREEN_SCALE_MAX:
+            raise LinkError(ERR_INVALID_ARGUMENT, f"\"scale\" must be from 0.1 to {SCREEN_SCALE_MAX:g}.")
         if not is_int(quality) or not 1 <= quality <= 100:
             raise LinkError(ERR_INVALID_ARGUMENT, "\"quality\" must be an integer from 1 to 100.")
-        if not is_int(max_fps) or not 1 <= max_fps <= 30:
-            raise LinkError(ERR_INVALID_ARGUMENT, "\"maxFps\" must be an integer from 1 to 30.")
+        if not is_int(max_fps) or not 1 <= max_fps <= SCREEN_FPS_MAX:
+            raise LinkError(ERR_INVALID_ARGUMENT, f"\"maxFps\" must be an integer from 1 to {SCREEN_FPS_MAX}.")
         fmt, bitrate = b.get("format", "jpeg"), b.get("bitrate")
         if fmt not in ("jpeg", "h264"):
             raise LinkError(ERR_INVALID_ARGUMENT, "\"format\" must be \"jpeg\" or \"h264\".")
@@ -3923,22 +4235,28 @@ class ScreenPlugin(Plugin):
         await self._stop_stream(conn)
         if conn.state == "closed":
             raise LinkError(CERR_NOT_CONNECTED, "The phone disconnected.")
-        size = self._frame_size(out, scale, fmt)
+        size, native = self._frame_size(out, scale, fmt)
         if fmt == "h264" and bitrate is None:
             bitrate = self._default_bitrate(size, max_fps, quality)
         stream = _Stream(conn, name, float(scale), quality, max_fps, size, fmt, bitrate)
+        stream.native = native
+        stream.capture_scale = out["scale"] if native else float(scale)
         self.streams[conn] = stream
         stream.task = conn.spawn(self._run_video(stream) if fmt == "h264" else self._run(stream))
         log(f"{conn.label()}: streaming {name} as {fmt} at {size[0]}x{size[1]}, up to {max_fps} fps.", debug=True)
         return {"width": size[0], "height": size[1], "format": fmt}
 
-    @staticmethod
-    def _frame_size(out, scale, fmt):
+    def _frame_size(self, out, scale, fmt):
+        """((w, h), native): `scale` of the logical size, never more than the output's pixels (§8.6), so a large
+        scale means native pixels; `native` is whether that is exactly what came out."""
         w, h = max(1, round(out["width"] * scale)), max(1, round(out["height"] * scale))
+        pixels = self._native.get(out["name"])
+        if pixels is not None and (w >= pixels[0] or h >= pixels[1]):
+            w, h = pixels
         if fmt == "h264":
             # 4:2:0 chroma needs even sides.
             w, h = max(2, w - w % 2), max(2, h - h % 2)
-        return w, h
+        return (w, h), pixels == (w, h)
 
     @staticmethod
     def _default_bitrate(size, fps, quality):
@@ -3964,6 +4282,17 @@ class ScreenPlugin(Plugin):
         log(f"{stream.conn.label()}: stream of {stream.output} stopped ({reason}).", debug=True)
         await stream.conn.send("screen.stopped", {"reason": reason})
 
+    async def stop_output(self, name, reason="stopped"):
+        """Stop every stream of output `name` (it is about to go) and tell each phone `screen.stopped {reason}`."""
+        for conn in [c for c, s in self.streams.items() if s.output == name]:
+            async with self._lock_for(conn):
+                stream = self.streams.get(conn)
+                if stream is None or stream.output != name:
+                    continue
+                await self._stop_stream(conn)
+            log(f"{conn.label()}: stream of {name} stopped ({reason}).", debug=True)
+            await conn.send("screen.stopped", {"reason": reason})
+
     async def _run(self, s):
         grim = tool("grim")
         interval = 1.0 / s.max_fps
@@ -3982,7 +4311,7 @@ class ScreenPlugin(Plugin):
                 await asyncio.sleep(delay)
             started, taken = time.monotonic(), now_ms()
             try:
-                rc, jpeg, err = await run_tool([grim or "grim", "-o", s.output, "-s", f"{s.scale:g}", "-t", "jpeg",
+                rc, jpeg, err = await run_tool([grim or "grim", "-o", s.output, "-s", f"{s.capture_scale:g}", "-t", "jpeg",
                                                 "-q", str(s.quality), "-c", "-"], timeout=10)
             except LinkError as e:
                 rc, jpeg, err = -1, b"", e.message.encode()
@@ -4021,7 +4350,12 @@ class ScreenPlugin(Plugin):
         now = time.monotonic()
         for e in [e for e, until in self._skipped.items() if until <= now]:
             del self._skipped[e]
-        return [e for e in H264_ENCODERS if e not in self._skipped and os.path.exists(devices.get(e, "/"))]
+        found = [e for e in H264_ENCODERS if e not in self._skipped and os.path.exists(devices.get(e, "/"))]
+        # With an NVIDIA card VAAPI only decodes, so trying it first costs every first stream a failed start.
+        if "h264_nvenc" in found:
+            found.remove("h264_nvenc")
+            found.insert(0, "h264_nvenc")
+        return found
 
     def _note_encoder(self, encoder, count):
         """Remember how a run of `encoder` went. A hardware encoder that has never written a frame since the daemon
@@ -4046,8 +4380,11 @@ class ScreenPlugin(Plugin):
                 "-p", f"maxrate={rate}", "-p", f"bufsize={max(rate // 2, 50_000)}"]
         # Hardware encoders keep frames in flight by default (nvenc: 3 or more), which is latency the phone would see.
         if encoder == "h264_vaapi":
-            return argv + ["-d", VAAPI_DEVICE, "-F", f"scale_vaapi=w={w}:h={h}:format=nv12", "-p", "async_depth=1"]
-        argv += ["-x", "yuv420p", "-F", f"scale={w}:{h}"]
+            vaapi = "scale_vaapi=format=nv12" if s.native else f"scale_vaapi=w={w}:h={h}:format=nv12"
+            return argv + ["-d", VAAPI_DEVICE, "-F", vaapi, "-p", "async_depth=1"]
+        argv += ["-x", "yuv420p"]
+        if not s.native:
+            argv += ["-F", f"scale={w}:{h}"]
         if encoder == "libx264":
             argv += ["-p", "preset=ultrafast", "-p", "tune=zerolatency"]
         elif encoder == "h264_nvenc":
@@ -4084,7 +4421,7 @@ class ScreenPlugin(Plugin):
                     return
                 await asyncio.sleep(0.5)
                 # The output may have changed mode or turned; the next encoder starts on a keyframe.
-                s.size = self._frame_size(out, s.scale, "h264")
+                s.size, s.native = self._frame_size(out, s.scale, "h264")
                 s.need_key = True
         finally:
             sender.cancel()
@@ -4492,8 +4829,1039 @@ class ThemePlugin(Plugin):
 
 
 # The plugin registry: order is the order of `ready.plugins`. A new plugin is one class above and one entry here.
+# ── desktop (§8.11) ────────────────────────────────────────────────────────
+
+
+def lua(value):
+    """A Python value as a Lua literal, for `hyprctl eval`. Strings are escaped, so a name can carry anything."""
+    if value is None:
+        return "nil"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(round(value, 6))
+    if isinstance(value, str):
+        out = []
+        for ch in value:
+            if ch in "\\\"":
+                out.append("\\" + ch)
+            elif ch == "\n":
+                out.append("\\n")
+            elif ord(ch) < 32 or ord(ch) == 127:
+                out.append(f"\\{ord(ch):03d}")
+            else:
+                out.append(ch)
+        return "\"" + "".join(out) + "\""
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{k} = {lua(v)}" for k, v in value.items()) + " }"
+    if isinstance(value, (list, tuple)):
+        return "{ " + ", ".join(lua(v) for v in value) + " }"
+    raise TypeError(f"No Lua literal for {type(value).__name__}.")
+
+
+class UinputTouch:
+    """A multitouch screen through /dev/uinput (§8.11): INPUT_PROP_DIRECT, DESKTOP_TOUCH_SLOTS slots (type B), positions
+    over 0..DESKTOP_TOUCH_MAX whatever the output's size. `update()` takes every finger that is down and writes only
+    the difference, as one frame ending in SYN_REPORT, so a lost or coalesced message can never leave a finger down.
+    The lowest slot also drives ABS_X/ABS_Y and BTN_TOUCH, which single-touch readers look at.
+
+    From <linux/uinput.h> and <linux/input.h> (x86_64 and every other 64-bit target):
+      UI_SET_EVBIT/KEYBIT/ABSBIT/PROPBIT = _IOW('U', 100/101/103/110, int), UI_DEV_SETUP = _IOW('U', 3, 92),
+      UI_ABS_SETUP = _IOW('U', 4, 28), UI_DEV_CREATE = _IO('U', 1), UI_DEV_DESTROY = _IO('U', 2)
+      struct uinput_setup { u16 bustype, vendor, product, version; char name[80]; u32 ff_effects_max }
+      struct uinput_abs_setup { u16 code; struct input_absinfo { s32 value, minimum, maximum, fuzz, flat, resolution } }
+      struct input_event { struct timeval (two longs); u16 type, code; s32 value }; a zero time is stamped by the kernel
+    """
+
+    EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+    SYN_REPORT = 0
+    BTN_TOUCH = 0x14a
+    ABS_X, ABS_Y = 0x00, 0x01
+    ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2f, 0x35, 0x36, 0x39
+    INPUT_PROP_DIRECT = 0x01
+    BUS_VIRTUAL = 0x06
+    # Units per mm. Consumers map positions onto the output, so this only makes the device report a phone's size
+    # (about 109 mm across) rather than a wall's.
+    RESOLUTION = 300
+
+    @staticmethod
+    def _ioc(direction, nr, size):
+        return (direction << 30) | (size << 16) | (ord("U") << 8) | nr
+
+    def __init__(self, path, name):
+        self.path = path
+        self.name = name
+        self.fd = None
+        self.down = {}             # slot → (x, y) of each finger down
+        self._tracking = 0
+        self._primary = None       # (x, y) last sent as ABS_X/ABS_Y
+
+    def open(self):
+        """Create the device; raises OSError (no access, no uinput module)."""
+        fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            w = self._ioc(1, 0, 4)
+            for ev in (self.EV_KEY, self.EV_ABS):
+                fcntl.ioctl(fd, w | 100, ev)
+            fcntl.ioctl(fd, w | 101, self.BTN_TOUCH)
+            fcntl.ioctl(fd, w | 110, self.INPUT_PROP_DIRECT)
+            axes = [(self.ABS_X, DESKTOP_TOUCH_MAX, self.RESOLUTION), (self.ABS_Y, DESKTOP_TOUCH_MAX, self.RESOLUTION),
+                    (self.ABS_MT_SLOT, DESKTOP_TOUCH_SLOTS - 1, 0), (self.ABS_MT_TRACKING_ID, 65535, 0),
+                    (self.ABS_MT_POSITION_X, DESKTOP_TOUCH_MAX, self.RESOLUTION),
+                    (self.ABS_MT_POSITION_Y, DESKTOP_TOUCH_MAX, self.RESOLUTION)]
+            for code, maximum, resolution in axes:
+                fcntl.ioctl(fd, w | 103, code)
+                fcntl.ioctl(fd, self._ioc(1, 4, 28), struct.pack("=HHiiiiii", code, 0, 0, 0, maximum, 0, 0, resolution))
+            setup = struct.pack("=HHHH80sI", self.BUS_VIRTUAL, 0x494c, 0x0001, 1, self.name.encode(), 0)
+            fcntl.ioctl(fd, self._ioc(1, 3, 92), setup)
+            fcntl.ioctl(fd, self._ioc(0, 1, 0))
+        except OSError:
+            os.close(fd)
+            raise
+        self.fd = fd
+
+    def _event(self, type_, code, value):
+        return struct.pack("@llHHi", 0, 0, type_, code, value)
+
+    def update(self, touches):
+        """`touches`: slot → (x, y), every finger down now. Writes downs, moves and ups as one frame."""
+        if self.fd is None:
+            return
+        ev = []
+        for slot in sorted(set(self.down) - set(touches)):
+            ev += [self._event(self.EV_ABS, self.ABS_MT_SLOT, slot), self._event(self.EV_ABS, self.ABS_MT_TRACKING_ID, -1)]
+        for slot, (x, y) in sorted(touches.items()):
+            old = self.down.get(slot)
+            if old == (x, y):
+                continue
+            ev.append(self._event(self.EV_ABS, self.ABS_MT_SLOT, slot))
+            if old is None:
+                self._tracking = self._tracking % 65535 + 1
+                ev.append(self._event(self.EV_ABS, self.ABS_MT_TRACKING_ID, self._tracking))
+            if old is None or old[0] != x:
+                ev.append(self._event(self.EV_ABS, self.ABS_MT_POSITION_X, x))
+            if old is None or old[1] != y:
+                ev.append(self._event(self.EV_ABS, self.ABS_MT_POSITION_Y, y))
+        if not ev:
+            return
+        if touches and not self.down:
+            ev.append(self._event(self.EV_KEY, self.BTN_TOUCH, 1))
+        elif self.down and not touches:
+            ev.append(self._event(self.EV_KEY, self.BTN_TOUCH, 0))
+        primary = touches[min(touches)] if touches else None
+        if primary is not None and primary != self._primary:
+            ev += [self._event(self.EV_ABS, self.ABS_X, primary[0]), self._event(self.EV_ABS, self.ABS_Y, primary[1])]
+        self._primary = primary
+        ev.append(self._event(self.EV_SYN, self.SYN_REPORT, 0))
+        self.down = dict(touches)
+        try:
+            os.write(self.fd, b"".join(ev))
+        except OSError as e:
+            log(f"Touch: could not write to {self.path}: {e.strerror or e}.", debug=True)
+
+    def lift(self):
+        self.update({})
+
+    def close(self):
+        if self.fd is None:
+            return
+        self.lift()
+        try:
+            fcntl.ioctl(self.fd, self._ioc(0, 2, 0))
+        except OSError:
+            pass
+        os.close(self.fd)
+        self.fd = None
+
+
+class _Desktop:
+    """The phone desktop while it exists: one output of the running Hyprland, owned by one phone."""
+
+    def __init__(self, owner, output):
+        self.owner = owner         # device id of the phone it belongs to
+        self.conn = None           # that phone's connection; None while it may still come back (DESKTOP_GRACE)
+        self.output = output
+        self.width = self.height = 0   # pixels, as asked
+        self.scale = 1.0           # as asked; `monitor` holds what Hyprland made of it
+        self.refresh = 60
+        self.position = (0, 0)     # layout px, away from every real monitor
+        self.monitor = None        # this output's entry of `hyprctl monitors -j`
+        self.source = None         # the real monitor whose wallpaper it borrows
+        self.touch = None          # UinputTouch
+        self.ime = None            # InputMethod
+        self.text_active = False   # whether the phone was last told a text field has focus
+        self.grace = None          # task ending the desktop once the grace is over
+        self.grace_ends = None     # ms
+        self.events = None         # task following Hyprland's event socket
+        self.clamp = None          # TimerHandle of the next floating-window check
+        self.lock = None           # LockWatch
+        self.ime_retry = None      # task binding the input method again after its connection went
+        self.reloads = 0           # config reloads seen ...
+        self.remapped = 0          # ... and how many of them the touch mapping has caught up with
+        self.touched = 0.0         # monotonic time of the phone's last touch; 0 once a new window has used it
+        self.touch_times = collections.deque(maxlen=64)  # CLOCK_BOOTTIME of recent touches, at most two a second
+
+
+class DesktopPlugin(Plugin):
+    """§8.11. A headless Hyprland output sized like the phone, a uinput touchscreen mapped to it, and while it exists
+    the seat's input method. Everything Hyprland is asked goes through `hyprctl eval` (the Lua config's API):
+
+      open    hl.workspace_rule / hl.window_rule for `m[IONIX-LINK-1]` (unless `hyprctl workspacerules -j` lists
+              them: they cannot be removed, match nothing once the output is gone, and a config reload drops them),
+              hl.monitor({ output, mode, position, scale }), `hyprctl output create headless IONIX-LINK-1`, then
+              hl.device({ name = "ionix-link-touch", output }) once the touch device shows up in `hyprctl devices -j`
+              (a device that cannot be mapped is destroyed again)
+      resize  hl.monitor again: Hyprland changes the mode in place and the windows and workspace stay
+      close   every window on a normal workspace of that output → the focused real monitor's active workspace
+              (hl.dsp.window.move), then `hyprctl output remove IONIX-LINK-1`
+
+    Windows fill the screen through the workspace rule's `monocle` layout, with no gaps, border, rounding, shadow
+    or decoration there; floating ones are centred when they open and pulled inside the screen whenever Hyprland's
+    event socket says one opened, moved or started floating. That socket also says when the output disappears
+    (`failed`) and when the config was reloaded, which drops every rule added at runtime, so they are added again.
+    """
+
+    name = "desktop"
+    tools = ("hyprctl",)
+    NAV = ("back", "home", "overview")
+    CLAMP_DELAY = 0.15             # s after a window event before floating windows are checked, so a burst is one check
+    ADOPT_WINDOW = 6.0             # s after a touch in which the next new window is taken to be what the touch opened
+    ADOPT_START = 3.0              # s after a touch in which a process that starts is taken to be what the touch started
+    ADOPT_SLOW = 60.0              # s such a process has to show its windows and still have them brought over
+    IME_RETRY = (1, 2, 5, 10, 30)  # s before each attempt to bind the input method again, the last one repeating
+    NO_LAYOUT = "no phone layout on"   # how the shell's phone IPC answers for an output without its phone layout
+    EVENTS = {"openwindow", "movewindowv2", "changefloatingmode"}
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.desktop = None
+        self._hyprland = None      # whether hyprctl answers a Hyprland; None until asked
+        self._ime_ok = (-DESKTOP_PROBE_TTL, False)   # (monotonic time, result) of the last probe
+        self._nav_ok = (-DESKTOP_PROBE_TTL, False)
+        self._busy = asyncio.Lock()       # one open, resize or close at a time
+        self._ordered = asyncio.Lock()    # desktop.commit and desktop.nav run in the order they came
+        self._text = asyncio.Lock()       # textInput pushes in the order the input method changed
+        self._claiming = asyncio.Lock()   # new windows judged one at a time, so only one can be "the first"
+
+    def available(self):
+        return super().available() and self._hyprland is not False
+
+    def caps(self):
+        caps = []
+        if os.access(self.daemon.paths.uinput, os.W_OK):
+            caps.append("touch")
+        if self._ime_ok[1]:
+            caps.append("ime")
+        if self._nav_ok[1]:
+            caps.append("nav")
+        return caps
+
+    async def prepare(self):
+        await self._check_hyprland()
+        if not self._hyprland:
+            return
+        now = time.monotonic()
+        if now - self._ime_ok[0] >= DESKTOP_PROBE_TTL:
+            self._ime_ok = (now, await self._probe_ime())
+        if now - self._nav_ok[0] >= DESKTOP_PROBE_TTL:
+            self._nav_ok = (now, await self._probe_nav())
+
+    async def _check_hyprland(self):
+        hyprctl = tool("hyprctl")
+        ok = False
+        if hyprctl:
+            try:
+                rc, out, _ = await run_tool([hyprctl, "version", "-j"], timeout=3)
+                ok = rc == 0 and isinstance(json.loads(out), dict)
+            except (LinkError, ValueError):
+                ok = False
+        if ok != self._hyprland:
+            log(f"Phone desktop: {'Hyprland answers' if ok else 'no Hyprland session; the desktop plugin is off'}.",
+                debug=True)
+        self._hyprland = ok
+
+    async def _probe_ime(self):
+        """Whether the compositor offers an input method. Only the registry is read: binding one, even for a moment,
+        could take the seat from the user's own input method as it starts. Whether the seat is free is only found
+        out at desktop.open, and its reply's `ime` says (§8.11)."""
+        d = self.desktop
+        if d is not None and d.ime is not None and d.ime.ready:
+            return True
+        return await WaylandProbe("wl_seat", "zwp_input_method_manager_v2").offered()
+
+    async def _probe_nav(self):
+        qs = tool("qs")
+        if not qs:
+            return False
+        try:
+            rc, out, _ = await run_tool([qs, "-c", "ionix", "ipc", "show"], timeout=3)
+        except LinkError:
+            return False
+        return rc == 0 and any(line.strip() == "target phone" for line in out.decode("utf-8", "replace").splitlines())
+
+    # Hyprland
+
+    async def _hypr_json(self, *what):
+        hyprctl = tool("hyprctl")
+        if not hyprctl:
+            raise LinkError(ERR_UNAVAILABLE, "hyprctl is not installed, so there is no phone desktop.")
+        rc, out, err = await run_tool([hyprctl, *what, "-j"], timeout=5)
+        if rc != 0:
+            raise LinkError(ERR_UNAVAILABLE, f"hyprctl {' '.join(what)} failed: "
+                            f"{(err or out).decode('utf-8', 'replace').strip()[:200]}")
+        try:
+            return json.loads(out)
+        except ValueError:
+            raise LinkError(ERR_UNAVAILABLE, f"hyprctl {' '.join(what)} did not answer with JSON; is Hyprland running?")
+
+    async def _hyprctl(self, *args):
+        """Run hyprctl; True when it said ok (or nothing)."""
+        hyprctl = tool("hyprctl")
+        if not hyprctl:
+            return False
+        try:
+            rc, out, err = await run_tool([hyprctl, *args], timeout=5)
+        except LinkError as e:
+            log(f"Phone desktop: hyprctl {args[0]}: {e.message}")
+            return False
+        text = (out + err).decode("utf-8", "replace").strip()
+        if rc != 0 or (text and text.lower() != "ok"):
+            log(f"Phone desktop: hyprctl {' '.join(args)[:300]}: {text[:300] or f'status {rc}'}")
+            return False
+        return True
+
+    async def _eval(self, chunk):
+        return await self._hyprctl("eval", chunk)
+
+    async def _monitors(self):
+        monitors = await self._hypr_json("monitors")
+        return [m for m in monitors if isinstance(m, dict) and isinstance(m.get("name"), str)] \
+            if isinstance(monitors, list) else []
+
+    @staticmethod
+    def _real(monitors):
+        return [m for m in monitors if not m["name"].startswith(DESKTOP_PREFIX) and m.get("disabled") is not True]
+
+    async def _ensure_rules(self):
+        """Add the output's workspace and window rules unless Hyprland has them. They cannot be removed, match nothing
+        once the output is gone, and a config reload drops them, with or without a desktop open. Both go in one chunk,
+        so the workspace rule, which `hyprctl workspacerules` lists, stands for the pair."""
+        where = f"m[{DESKTOP_OUTPUT}]"
+        try:
+            rules = await self._hypr_json("workspacerules")
+        except LinkError:
+            rules = None           # cannot tell: adding them again only repeats a rule
+        if isinstance(rules, list) and any(isinstance(r, dict) and r.get("workspaceString") == where for r in rules):
+            return
+        chunk = "\n".join([
+            "hl.workspace_rule(" + lua({"workspace": where, "layout": "monocle", "gaps_in": 0, "gaps_out": 0,
+                                         "border_size": 0, "no_rounding": True, "no_shadow": True,
+                                         "decorate": False}) + ")",
+            "hl.window_rule(" + lua({"match": {"workspace": where, "float": True}, "center": True}) + ")",
+        ])
+        await self._eval(chunk)
+
+    @staticmethod
+    def _clean_scale(width, height, scale):
+        """`scale` moved to the nearest one Hyprland takes without complaint, as the text to hand it. Hyprland wants
+        whole logical pixels: a scale that leaves a fraction is replaced by a neighbour, and reported as a config
+        error on the user's screen every time. So the search it would do (steps of 1/120, as fractional-scale-v1
+        counts) is done here first, and the result written with enough digits to survive its float."""
+        def clean(k):
+            s = k / 120.0
+            return width / s == round(width / s) and height / s == round(height / s)
+        nearest = round(scale * 120)
+        for step in range(0, 121):
+            for k in (nearest - step, nearest + step):
+                if 120 <= k <= 480 and clean(k):
+                    return f"{k / 120.0:.8f}".rstrip("0").rstrip(".")
+        return f"{round(scale, 4):g}"
+
+    async def _apply_monitor(self, d):
+        spec = {"output": d.output, "mode": f"{d.width}x{d.height}@{d.refresh}",
+                "position": f"{d.position[0]}x{d.position[1]}", "scale": self._clean_scale(d.width, d.height, d.scale)}
+        return await self._eval("hl.monitor(" + lua(spec) + ")")
+
+    async def _wait_monitor(self, d, size=None):
+        """This output's monitor entry once Hyprland has it (in `size`, when given), or the last seen one."""
+        deadline = time.monotonic() + DESKTOP_WAIT
+        found = None
+        while True:
+            try:
+                found = next((m for m in await self._monitors() if m["name"] == d.output), found)
+            except LinkError:
+                pass
+            if found is not None and (size is None or (found.get("width"), found.get("height")) == size):
+                return found
+            if time.monotonic() >= deadline:
+                return found
+            await asyncio.sleep(0.1)
+
+    async def _map_touch(self, d):
+        return await self._eval("hl.device(" + lua({"name": self.daemon.paths.touch_device, "output": d.output}) + ")")
+
+    async def _remove_output(self, name):
+        """Move the windows of output `name` to the focused real monitor's active workspace, then remove it."""
+        try:
+            monitors = await self._monitors()
+            clients = await self._hypr_json("clients")
+        except LinkError as e:
+            log(f"Phone desktop: {e.message}")
+            monitors, clients = [], []
+        mon = next((m for m in monitors if m["name"] == name), None)
+        real = self._real(monitors)
+        target = next((m for m in real if m.get("focused") is True), real[0] if real else None)
+        workspace = (target or {}).get("activeWorkspace", {}).get("id")
+        if mon is not None and is_int(workspace):
+            moves = []
+            for c in clients if isinstance(clients, list) else []:
+                ws = c.get("workspace", {}).get("id") if isinstance(c, dict) else None
+                # Special workspaces (minimised windows, scratchpads) go with the output's workspaces on removal.
+                if c.get("monitor") == mon.get("id") and is_int(ws) and ws > 0 and isinstance(c.get("address"), str):
+                    moves.append("hl.dispatch(hl.dsp.window.move(" + lua({"workspace": workspace, "follow": False,
+                                 "window": f"address:{c['address']}"}) + "))")
+            if moves:
+                await self._eval("\n".join(moves))
+        if mon is not None or not monitors:
+            await self._hyprctl("output", "remove", name)
+
+    async def clean_stale(self):
+        """At start-up: a phone desktop left by a daemon that died is nobody's; remove it (§8.11)."""
+        if not tool("hyprctl") or self.daemon.config["plugins"].get(self.name, True) is False:
+            return
+        await self._check_hyprland()
+        if not self._hyprland:
+            return
+        # Under the lock, and with the monitors read inside it: a phone that connects at once must not lose the
+        # output it has just been given.
+        async with self._busy:
+            try:
+                stale = [m["name"] for m in await self._monitors() if m["name"].startswith(DESKTOP_PREFIX)]
+            except LinkError:
+                return
+            for name in stale:
+                if self.desktop is not None and self.desktop.output == name:
+                    continue
+                log(f"Removing {name}, a phone desktop nobody owns.")
+                await self._remove_output(name)
+
+    # Lifecycle
+
+    def state(self):
+        """state.json's `desktop` (§10)."""
+        d = self.desktop
+        if d is None or d.monitor is None:
+            return None
+        m = d.monitor
+        lw, lh = ScreenPlugin._logical(m.get("width", 0), m.get("height", 0), m.get("scale", 1), m.get("transform", 0))
+        state = {"device": d.owner, "output": d.output, "width": m.get("width", d.width),
+                 "height": m.get("height", d.height), "scale": float(m.get("scale", d.scale) or d.scale),
+                 "logicalWidth": lw, "logicalHeight": lh, "connected": d.conn is not None,
+                 "touch": d.touch is not None, "ime": d.ime is not None and d.ime.ready}
+        if d.conn is None and d.grace_ends is not None:
+            state["graceEnds"] = d.grace_ends
+        return state
+
+    def _reply(self, d, created):
+        s = self.state()
+        return {"output": d.output, "width": s["width"], "height": s["height"], "scale": s["scale"],
+                "logicalWidth": s["logicalWidth"], "logicalHeight": s["logicalHeight"], "created": created,
+                "touch": s["touch"], "ime": s["ime"]}
+
+    async def _open(self, conn, b):
+        width, height, scale, refresh = b.get("width"), b.get("height"), b.get("scale"), b.get("refresh", 60)
+        for key, v in (("width", width), ("height", height)):
+            if not is_int(v) or not 320 <= v <= 4096 or v % 2:
+                raise LinkError(ERR_INVALID_ARGUMENT, f"\"{key}\" must be an even number of pixels from 320 to 4096.")
+        if not is_number(scale) or not 1.0 <= scale <= 4.0:
+            raise LinkError(ERR_INVALID_ARGUMENT, "\"scale\" must be from 1.0 to 4.0.")
+        if not is_int(refresh) or refresh not in (30, 60):
+            raise LinkError(ERR_INVALID_ARGUMENT, "\"refresh\" must be 30 or 60.")
+        return await self._shielded(self._open_now(conn, width, height, float(scale), refresh))
+
+    def _shielded(self, coro):
+        """Run `coro` to the end even if the phone disconnects (which cancels its request) half way through making or
+        removing an output, so nothing is left half made."""
+        task = self.daemon.spawn(coro)
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        return asyncio.shield(task)
+
+    async def _open_now(self, conn, width, height, scale, refresh):
+        me = conn.device["id"]
+        async with self._busy:
+            if conn.state == "closed":
+                raise LinkError(CERR_NOT_CONNECTED, "The phone disconnected.")
+            if not self.available():
+                raise LinkError(ERR_PLUGIN_UNAVAILABLE, "The phone desktop is switched off on this desktop "
+                                "(plugins.desktop in config.json), or Hyprland is not running.")
+            d = self.desktop
+            if d is not None and d.owner != me:
+                owner = self.daemon.devices.get(d.owner)
+                raise LinkError(ERR_BUSY, f"{owner['name'] if owner else 'Another phone'} has the desktop's phone screen; "
+                                "close it there first.")
+            if d is None:
+                d = await self._create(conn, width, height, scale, refresh)
+                created = True
+            else:
+                self._adopt(d, conn)
+                await self._resize(d, width, height, scale, refresh)
+                created = False
+            reply = self._reply(d, created)
+            if conn.state == "closed" and d.conn is conn:
+                await self.on_close(conn)     # it closed while this ran, after its on_close found no desktop
+        self.daemon.state.changed()
+        return reply
+
+    async def _create(self, conn, width, height, scale, refresh):
+        monitors = await self._monitors()
+        if any(m["name"] == DESKTOP_OUTPUT for m in monitors):
+            log(f"Removing an old {DESKTOP_OUTPUT} before making a new one.")
+            await self._remove_output(DESKTOP_OUTPUT)
+        real = self._real(monitors)
+        right = bottom = 0
+        for m in real:
+            lw, lh = ScreenPlugin._logical(m.get("width", 0), m.get("height", 0), m.get("scale", 1), m.get("transform", 0))
+            right, bottom = max(right, int(m.get("x", 0)) + lw), max(bottom, int(m.get("y", 0)) + lh)
+        d = _Desktop(conn.device["id"], DESKTOP_OUTPUT)
+        d.conn = conn
+        d.width, d.height, d.scale, d.refresh = width, height, scale, refresh
+        # Off both corners at once, so no edge of it lines up with a real monitor's and the mouse cannot cross over.
+        d.position = (right + DESKTOP_GAP, bottom + DESKTOP_GAP)
+        d.source = next((m["name"] for m in real if m.get("focused") is True), real[0]["name"] if real else None)
+        try:
+            await self._ensure_rules()
+            if not await self._apply_monitor(d):
+                raise LinkError(ERR_UNAVAILABLE, "Hyprland did not take the phone screen's monitor settings.")
+            if not await self._hyprctl("output", "create", "headless", d.output):
+                raise LinkError(ERR_UNAVAILABLE, "Hyprland could not make a headless output for the phone screen.")
+            d.monitor = await self._wait_monitor(d, (width, height))
+            if d.monitor is None:
+                raise LinkError(ERR_UNAVAILABLE, f"{d.output} did not appear in Hyprland's monitors.")
+            self.desktop = d
+            await self._start_touch(d)
+            await self._start_ime(d)
+            d.lock = LockWatch()
+            if d.lock.may_connect():
+                await d.lock.connect()
+        except BaseException:
+            self.desktop = None
+            await self._teardown(d)
+            raise
+        d.events = self.daemon.spawn(self._follow(d))
+        self.daemon.spawn(self._wallpaper(d))
+        log(f"{conn.label()}: phone desktop {d.output} open at {width}x{height}, scale {d.monitor.get('scale')}.")
+        return d
+
+    async def _resize(self, d, width, height, scale, refresh):
+        d.width, d.height, d.scale, d.refresh = width, height, scale, refresh
+        if not await self._apply_monitor(d):
+            raise LinkError(ERR_UNAVAILABLE, "Hyprland did not take the phone screen's new size.")
+        d.monitor = await self._wait_monitor(d, (width, height)) or d.monitor
+        self._schedule_clamp(d)
+        log(f"Phone desktop {d.output} now {width}x{height}, scale {d.monitor.get('scale')}.", debug=True)
+
+    async def _start_touch(self, d):
+        """Make the touch device and map it to the output. Hyprland sends the taps of a touchscreen it has not mapped
+        to the focused real monitor, so a device that cannot be mapped is destroyed again: no touch at all."""
+        if not os.access(self.daemon.paths.uinput, os.W_OK):
+            return
+        touch = UinputTouch(self.daemon.paths.uinput, self.daemon.paths.touch_name)
+        try:
+            touch.open()
+        except OSError as e:
+            log(f"Phone desktop: no touch, {self.daemon.paths.uinput} could not be used: {e.strerror or e}.")
+            return
+        d.touch = touch
+        listed = False
+        deadline = time.monotonic() + DESKTOP_WAIT
+        while not listed and time.monotonic() < deadline:
+            try:
+                devices = await self._hypr_json("devices")
+            except LinkError:
+                break
+            touches = devices.get("touch", []) if isinstance(devices, dict) else []
+            listed = any(isinstance(t, dict) and t.get("name") == self.daemon.paths.touch_device for t in touches)
+            if not listed:
+                await asyncio.sleep(0.1)
+        if not listed:
+            self._drop_touch(d, f"Hyprland never listed {self.daemon.paths.touch_device}")
+        elif not await self._map_touch(d):
+            self._drop_touch(d, f"Hyprland did not map it to {d.output}")
+
+    def _drop_touch(self, d, why):
+        if d.touch is None:
+            return
+        d.touch.close()
+        d.touch = None
+        log(f"Phone desktop: no touch, {why}; an unmapped touchscreen would tap the real monitors.")
+
+    async def _start_ime(self, d):
+        if not self._ime_ok[1]:
+            return
+        im = InputMethod(on_change=lambda active, purpose: self._text_changed(d), on_lost=lambda: self._ime_lost(d))
+        if await im.connect():
+            d.ime = im
+        elif im.unavailable:
+            log("Phone desktop: another input method holds the seat, so the phone's text is typed with wtype.")
+
+    def _ime_lost(self, d):
+        if self.desktop is not d or d.ime is None:
+            return
+        self.daemon.state.changed()
+        if d.ime_retry is None or d.ime_retry.done():
+            d.ime_retry = self.daemon.spawn(self._restart_ime(d))
+
+    async def _restart_ime(self, d):
+        """Bind the input method again after its connection went, backing off, for as long as the desktop exists.
+        Meanwhile desktop.commit types with wtype. Given up when another input method has taken the seat."""
+        attempt = 0
+        while self.desktop is d and d.ime is not None:
+            await asyncio.sleep(self.IME_RETRY[min(attempt, len(self.IME_RETRY) - 1)])
+            attempt += 1
+            im = d.ime
+            if self.desktop is not d or im is None or im.ready:
+                return
+            if await im.connect():
+                log(f"Phone desktop: the input method is back (attempt {attempt}).")
+                self.daemon.state.changed()
+                return
+            if im.unavailable:
+                log("Phone desktop: another input method has the seat now, so the phone's text is typed with wtype.")
+                return
+
+    def _adopt(self, d, conn):
+        """`conn` is the owner's connection now: a reconnect within the grace finds its desktop as it was."""
+        if d.conn is conn:
+            return
+        if d.grace is not None and d.grace is not asyncio.current_task():
+            d.grace.cancel()
+        d.grace = d.grace_ends = None
+        d.conn = conn
+        d.text_active = False
+        if d.touch is not None:
+            d.touch.lift()         # a replaced connection's fingers: its on_close finds the desktop no longer its own
+        log(f"{conn.label()} is back with its phone desktop.", debug=True)
+        if d.ime is not None and d.ime.active:
+            self._text_changed(d)
+
+    async def on_ready(self, conn):
+        d = self.desktop
+        if d is not None and d.owner == conn.device["id"]:
+            self._adopt(d, conn)
+            self.daemon.state.changed()
+
+    async def on_close(self, conn):
+        d = self.desktop
+        if d is None or d.conn is not conn:
+            return
+        d.conn = None
+        d.text_active = False
+        if d.touch is not None:
+            d.touch.lift()
+        d.grace_ends = now_ms() + DESKTOP_GRACE * 1000
+        d.grace = self.daemon.spawn(self._grace(d))
+        log(f"Phone desktop {d.output} kept for {DESKTOP_GRACE} s in case {conn.label()} comes back.", debug=True)
+
+    async def _grace(self, d):
+        await asyncio.sleep(DESKTOP_GRACE)
+        if self.desktop is d and d.conn is None:
+            await self.close_desktop(None, abandoned=d)
+
+    async def close_desktop(self, reason, abandoned=None):
+        """End the desktop. `reason` is pushed as `desktop.closed` when the owner is connected; None sends nothing
+        (desktop.close answers for itself, a phone gone for good hears nothing). `abandoned`: only end that desktop,
+        and only if its phone is still away once the lock is had (an open queued ahead may have taken it back).
+        Returns whether one was closed."""
+        return await self._shielded(self._close(reason, abandoned))
+
+    async def _close(self, reason, abandoned=None):
+        async with self._busy:
+            d = self.desktop
+            if d is None or (abandoned is not None and (d is not abandoned or d.conn is not None)):
+                return False
+            self.desktop = None
+            if abandoned is not None:
+                log(f"Phone desktop {d.output} closed: its phone did not come back.")
+            await self._teardown(d)
+        if reason is not None:
+            log(f"Phone desktop {d.output} closed ({reason}).")
+        if reason is not None and d.conn is not None:
+            await d.conn.send("desktop.closed", {"reason": reason})
+        self.daemon.state.changed()
+        return True
+
+    async def _teardown(self, d):
+        current = asyncio.current_task()
+        for task in (d.grace, d.events):
+            if task is not None and task is not current:
+                task.cancel()
+        if d.ime_retry is not None and d.ime_retry is not current:
+            d.ime_retry.cancel()
+        if d.clamp is not None:
+            d.clamp.cancel()
+        if d.touch is not None:
+            d.touch.close()
+        if d.ime is not None:
+            d.ime.on_change = d.ime.on_lost = None
+            d.ime.close()
+        if d.lock is not None:
+            d.lock.close()
+        screen = self.daemon.plugins.get("screen")
+        if screen is not None:
+            await screen.stop_output(d.output)
+        await self._remove_output(d.output)
+
+    # Following Hyprland
+
+    async def _follow(self, d):
+        """Hyprland's events for as long as the desktop exists: the output gone → `failed`, a config reload → the
+        runtime rules and settings again, window changes → the floating-window check. Without the socket, a poll
+        every few seconds still notices the output going."""
+        path = self.daemon.paths.hyprland_events()
+        failures = 0
+        while self.desktop is d:
+            if path and os.path.exists(path):
+                try:
+                    reader, writer = await asyncio.open_unix_connection(path)
+                except OSError as e:
+                    log(f"Phone desktop: cannot read Hyprland's events from {path}: {e}.", debug=True)
+                else:
+                    try:
+                        while self.desktop is d:
+                            line = await reader.readline()
+                            if not line:
+                                break
+                            if not self._on_event(d, line.decode("utf-8", "replace").rstrip("\n")):
+                                return
+                    except (OSError, ValueError):
+                        pass
+                    finally:
+                        writer.close()
+            await asyncio.sleep(2 if path else 5)
+            try:
+                gone = d.output not in {m["name"] for m in await self._monitors()}
+                failures = 0
+            except LinkError:
+                # Three in a row: Hyprland itself is gone, and the output with it.
+                failures += 1
+                gone = failures >= 3
+            if gone and self.desktop is d:
+                self._failed(d)
+                return
+
+    def _on_event(self, d, line):
+        # Example:
+        # monitorremovedv2>>3,IONIX-LINK-1,Headless output 3
+        event, _, data = line.partition(">>")
+        if event in ("monitorremoved", "monitorremovedv2"):
+            name = data if event == "monitorremoved" else (data.split(",") + ["", ""])[1]
+            if name == d.output:
+                self._failed(d)
+                return False
+        elif event == "configreloaded":
+            # The touch mapping went with the reload: until _reapply has it back, a tap would land on a real monitor.
+            d.reloads += 1
+            if d.touch is not None:
+                d.touch.lift()
+            self.daemon.spawn(self._reapply(d))
+        elif event in self.EVENTS:
+            # Example:
+            # openwindow>>55d4d0f7cc10,3,google-chrome,New Tab - Google Chrome
+            if event == "openwindow":
+                recent = d.touched if d.touched and time.monotonic() - d.touched < self.ADOPT_WINDOW else 0.0
+                self.daemon.spawn(self._claim_window(d, "0x" + data.partition(",")[0], recent))
+            self._schedule_clamp(d)
+        return True
+
+    def _started_by_touch(self, d, pid):
+        """Whether process `pid` started within ADOPT_START s after a touch on the phone, at most ADOPT_SLOW s ago."""
+        try:
+            # Field 22 of /proc/<pid>/stat is the start time in clock ticks since boot; the name before it may hold
+            # spaces and brackets, so count from the last ")".
+            ticks = int(open(f"/proc/{pid}/stat").read().rpartition(")")[2].split()[19])
+        except (OSError, ValueError, IndexError):
+            return False
+        started = ticks / os.sysconf("SC_CLK_TCK")
+        if time.clock_gettime(time.CLOCK_BOOTTIME) - started > self.ADOPT_SLOW:
+            return False
+        return any(t <= started <= t + self.ADOPT_START for t in d.touch_times)
+
+    async def _claim_window(self, d, address, touched):
+        """Bring a window the phone opened onto the phone's output (§8.11). Hyprland puts a new window wherever the
+        seat's focus is by then, which is the desk whenever the mouse has moved since the tap. `touched`: the touch
+        within ADOPT_WINDOW s before the window opened, else 0. The first window after that touch is taken (an app
+        that was already running opens it from the old process); after that only windows of a process that started
+        right after a touch, which is an app that needs longer to show up.
+        Never taken: a floating window (Hyprland floats dialogs and every other window with a parent, which belong
+        with their parent), one on a special workspace (a scratchpad, a minimised window), and anything while the
+        session is locked. A tiled window of a process that has windows on the desk is still taken: that is how a
+        running browser opens one."""
+        async with self._claiming:
+            if self.desktop is not d:
+                return
+            if d.lock is not None and not d.lock.ready and d.lock.may_connect():
+                await d.lock.connect()     # its connection went: what it said about the lock went with it
+            try:
+                monitors = await self._monitors()
+                clients = await self._hypr_json("clients")
+            except LinkError as e:
+                log(f"Phone desktop: {e.message}")
+                return
+            if d.lock is not None and d.lock.locked:
+                return
+            mon = next((m for m in monitors if m["name"] == d.output), None)
+            workspace = (mon or {}).get("activeWorkspace", {}).get("id")
+            window = next((c for c in clients if isinstance(c, dict) and c.get("address") == address), None) \
+                if isinstance(clients, list) else None
+            if self.desktop is not d or mon is None or window is None or not is_int(workspace):
+                return
+            # Still unused: a window since has not taken it (that zeroes it), and a later touch only moves it on.
+            first = touched > 0 and d.touched >= touched
+            if window.get("monitor") == mon.get("id"):
+                if first:
+                    d.touched = 0.0    # what the touch opened, opened on the phone
+                return
+            ws = (window.get("workspace") or {}).get("id")
+            if window.get("floating") is True or not is_int(ws) or ws <= 0:
+                return
+            if first:
+                d.touched = 0.0
+            elif not self._started_by_touch(d, window.get("pid")):
+                return
+            log(f"Phone desktop: {window.get('class') or address} opened on the desk after a touch; moved to "
+                f"{d.output}.", debug=True)
+            await self._eval("hl.dispatch(hl.dsp.window.move(" + lua({"workspace": workspace, "follow": False,
+                             "window": f"address:{address}"}) + "))")
+
+    def _failed(self, d):
+        log(f"Phone desktop {d.output} disappeared.")
+        self.daemon.spawn(self.close_desktop("failed"))
+
+    async def _reapply(self, d):
+        """After a config reload: the rules, the monitor's settings and the touch mapping again. Touches are dropped
+        until the mapping has caught up with every reload seen, and a device that cannot be mapped again goes."""
+        async with self._busy:
+            if self.desktop is not d:
+                return
+            reloads = d.reloads
+            await self._ensure_rules()
+            await self._apply_monitor(d)
+            if d.touch is not None and not await self._map_touch(d):
+                self._drop_touch(d, f"Hyprland did not map it to {d.output} again after a config reload")
+            d.remapped = reloads
+        self.daemon.state.changed()
+
+    def _schedule_clamp(self, d):
+        if d.clamp is not None:
+            d.clamp.cancel()
+        d.clamp = asyncio.get_running_loop().call_later(self.CLAMP_DELAY, lambda: self.daemon.spawn(self._clamp(d)))
+
+    async def _clamp(self, d):
+        """Pull every floating window of the phone's output inside it, shrinking it to fit if it must."""
+        d.clamp = None
+        if self.desktop is not d:
+            return
+        try:
+            monitors, clients = await self._monitors(), await self._hypr_json("clients")
+        except LinkError:
+            return
+        mon = next((m for m in monitors if m["name"] == d.output), None)
+        if mon is None or not isinstance(clients, list):
+            return
+        d.monitor = mon
+        mx, my = int(mon.get("x", 0)), int(mon.get("y", 0))
+        lw, lh = ScreenPlugin._logical(mon.get("width", 0), mon.get("height", 0), mon.get("scale", 1),
+                                       mon.get("transform", 0))
+        steps = []
+        for c in clients:
+            if not isinstance(c, dict) or c.get("monitor") != mon.get("id") or c.get("floating") is not True:
+                continue
+            at, size = c.get("at"), c.get("size")
+            if not (isinstance(at, list) and isinstance(size, list) and len(at) == 2 and len(size) == 2):
+                continue
+            x, y, w, h = int(at[0]), int(at[1]), int(size[0]), int(size[1])
+            nw, nh = min(w, lw), min(h, lh)
+            nx, ny = min(max(x, mx), mx + lw - nw), min(max(y, my), my + lh - nh)
+            window = f"address:{c.get('address')}"
+            if (nw, nh) != (w, h):
+                steps.append("hl.dispatch(hl.dsp.window.resize(" + lua({"x": nw, "y": nh, "window": window}) + "))")
+            if (nx, ny) != (x, y):
+                steps.append("hl.dispatch(hl.dsp.window.move(" + lua({"x": nx, "y": ny, "window": window}) + "))")
+        if steps:
+            await self._eval("\n".join(steps))
+
+    async def _wallpaper(self, d):
+        """The focused monitor's picture on the phone's output, through awww, once awww-daemon has seen the output."""
+        awww = tool("awww")
+        if not awww or d.source is None:
+            return
+        listed = re.compile(r"^:?\s*([^:\s]+):")
+        picture = re.compile(r"^:?\s*([^:\s]+):.*currently displaying: image: (.+)$")
+        for _ in range(20):
+            if self.desktop is not d:
+                return
+            try:
+                rc, out, _ = await run_tool([awww, "query"], timeout=3)
+            except LinkError:
+                return
+            lines = out.decode("utf-8", "replace").splitlines() if rc == 0 else []
+            names = {m.group(1) for m in map(listed.match, lines) if m}
+            pictures = {m.group(1): m.group(2).strip() for m in map(picture.match, lines) if m}
+            source = pictures.get(d.source)
+            if d.output in names and source:
+                try:
+                    rc, _, err = await run_tool([awww, "img", "--outputs", d.output, "--transition-type", "none",
+                                                 source], timeout=10)
+                except LinkError as e:
+                    rc, err = -1, e.message.encode()
+                if rc != 0:
+                    log(f"Phone desktop: awww img failed: {err.decode('utf-8', 'replace').strip()[:200]}", debug=True)
+                return
+            if rc == 0 and not pictures:
+                return             # awww shows colours only: nothing to borrow
+            await asyncio.sleep(0.25)
+        log(f"Phone desktop: awww never listed {d.output}; it has no wallpaper.", debug=True)
+
+    # The phone's input
+
+    def _text_changed(self, d):
+        self.daemon.spawn(self._push_text(d))
+
+    async def _push_text(self, d):
+        """Tell the phone whether a text field has focus, judged by where the focused window is: only one on the
+        phone's own output counts (§8.11)."""
+        async with self._text:
+            if self.desktop is not d or d.conn is None or d.ime is None:
+                return
+            active = d.ime.active
+            if active:
+                try:
+                    window = await self._hypr_json("activewindow")
+                except LinkError:
+                    window = {}
+                monitor = (d.monitor or {}).get("id")
+                active = isinstance(window, dict) and monitor is not None and window.get("monitor") == monitor
+            if active:
+                d.text_active = True
+                await d.conn.send("desktop.textInput", {"active": True, "purpose": d.ime.purpose})
+            elif d.text_active:
+                d.text_active = False
+                await d.conn.send("desktop.textInput", {"active": False})
+
+    @staticmethod
+    def _touches(body):
+        touches = body.get("touches")
+        if not isinstance(touches, list) or len(touches) > DESKTOP_TOUCH_SLOTS:
+            raise LinkError(ERR_INVALID_ARGUMENT, f"\"touches\" must be a list of at most {DESKTOP_TOUCH_SLOTS} fingers.")
+        points = {}
+        for t in touches:
+            fid = t.get("id") if isinstance(t, dict) else None
+            if not is_int(fid) or not 0 <= fid < DESKTOP_TOUCH_SLOTS or fid in points \
+                    or not is_number(t.get("x")) or not is_number(t.get("y")):
+                raise LinkError(ERR_INVALID_ARGUMENT, "Each touch needs a distinct \"id\" from 0 to 9 and numbers \"x\" "
+                                "and \"y\".")
+            points[fid] = tuple(round(min(max(float(t[k]), 0.0), 1.0) * DESKTOP_TOUCH_MAX) for k in ("x", "y"))
+        return points
+
+    async def _wtype(self, *argv, stdin=None):
+        wtype = tool("wtype")
+        if not wtype:
+            log("Phone desktop: wtype is not installed, so text without an input method is dropped.", debug=True)
+            return
+        try:
+            await run_tool([wtype, "-k", "Shift_L", *argv], stdin=stdin, timeout=min(300, 10 + len(stdin or b"") / 200))
+        except LinkError as e:
+            log(f"Phone desktop: {e.message}", debug=True)
+
+    async def _commit(self, d, text, delete_before):
+        async with self._ordered:
+            if self.desktop is not d:
+                return
+            ime = d.ime
+            if ime is not None and ime.active:
+                if delete_before and not ime.knows_surrounding():
+                    # The text field does not say what is before the cursor, and deletion goes by bytes.
+                    await self._wtype(*["-k", "BackSpace"] * delete_before)
+                    delete_before = 0
+                rest = ime.commit(text or "", delete_before)
+                if rest == "":
+                    return
+                if rest is not None:
+                    text, delete_before = rest, 0     # the connection went half way: type the rest
+            if delete_before:
+                await self._wtype(*["-k", "BackSpace"] * delete_before)
+            if text:
+                await self._wtype("-", stdin=text.encode("utf-8"))
+
+    async def _nav(self, d, action):
+        async with self._ordered:
+            if self.desktop is not d:
+                return
+            qs = tool("qs")
+            if self._nav_ok[1] and qs:
+                try:
+                    rc, out, err = await run_tool([qs, "-c", "ionix", "ipc", "call", "phone", action, d.output],
+                                                  timeout=5)
+                except LinkError as e:
+                    rc, out, err = -1, b"", e.message.encode()
+                answer = out.decode("utf-8", "replace").strip()
+                if rc == 0 and not answer.startswith(self.NO_LAYOUT):
+                    return
+                # The shell has no phone layout there (phone.enabled off) or did not answer: Back is still Escape.
+                log(f"Phone desktop: the shell did not take {action}: "
+                    f"{(answer if rc == 0 else err.decode('utf-8', 'replace').strip())[:200]}", debug=True)
+            if action == "back":
+                await self._wtype("-k", "Escape")
+
+    async def handle(self, conn, msg, data):
+        t = msg["type"]
+        b = msg["body"]
+        if t == "desktop.open":
+            return await self._open(conn, b)
+        if t == "desktop.close":
+            d = self.desktop
+            if d is not None and d.owner == conn.device["id"] and await self.close_desktop(None):
+                log(f"{conn.label()} closed its phone desktop.")
+            return {}
+        d = self.desktop
+        mine = d is not None and d.conn is conn
+        if t == "desktop.touch":
+            points = self._touches(b)
+            # Dropped while a config reload has the device unmapped, so a tap cannot land on a real monitor.
+            if mine and d.touch is not None and d.reloads == d.remapped:
+                d.touch.update(points)
+                if d.lock is not None and d.lock.locked:
+                    return None    # a touch on the lock screen opens nothing
+                d.touched = time.monotonic()
+                boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+                if not d.touch_times or boot - d.touch_times[-1] >= 0.5:
+                    d.touch_times.append(boot)
+            return None
+        if t == "desktop.commit":
+            text, delete_before = b.get("text"), b.get("deleteBefore", 0)
+            if text is not None and (not isinstance(text, str) or len(text.encode("utf-8")) > DESKTOP_COMMIT_MAX):
+                raise LinkError(ERR_INVALID_ARGUMENT, f"\"text\" must be a string of at most {DESKTOP_COMMIT_MAX // 1024} KiB.")
+            if delete_before is None:
+                delete_before = 0
+            if not is_int(delete_before) or not 0 <= delete_before <= DESKTOP_DELETE_MAX:
+                raise LinkError(ERR_INVALID_ARGUMENT, f"\"deleteBefore\" must be from 0 to {DESKTOP_DELETE_MAX}.")
+            if mine and (text or delete_before):
+                self.spawn(self._commit(d, text, delete_before))
+            return None
+        if t == "desktop.nav":
+            action = b.get("action")
+            if action not in self.NAV:
+                raise LinkError(ERR_INVALID_ARGUMENT, "\"action\" must be back, home or overview.")
+            if mine:
+                self.spawn(self._nav(d, action))
+            return None
+        return await super().handle(conn, msg, data)
+
+
 PLUGINS = [NotificationsPlugin, MediaPlugin, CommandsPlugin, ClipboardPlugin, InputPlugin, ScreenPlugin, StatusPlugin,
-           ThemePlugin, SharePlugin]
+           ThemePlugin, SharePlugin, DesktopPlugin]
 
 
 # ── Discovery (§4.1) ───────────────────────────────────────────────────────
@@ -4650,7 +6018,8 @@ class ControlServer:
 
     async def dispatch(self, cmd, args, writer):
         """One request → (result dict, follow-up coroutine or None), or raise LinkError with a §9 code. Commands:
-        version, status, devices, pair, pair.respond, unpair, ring, clipboard, commands, reload, subscribe."""
+        version, status, devices, pair, pair.respond, unpair, ring, clipboard, commands, reload, subscribe, desktop,
+        desktop.close."""
         d = self.daemon
         if cmd == "version":
             return {"version": VERSION, "protocol": PROTOCOL}, None
@@ -4711,6 +6080,10 @@ class ControlServer:
         if cmd == "reload":
             d.reload()
             return {}, None
+        if cmd == "desktop":
+            return {"desktop": d.plugins["desktop"].state()}, None
+        if cmd == "desktop.close":
+            return {"closed": await d.plugins["desktop"].close_desktop("desktop")}, None
         if cmd == "subscribe":
             queue = asyncio.Queue()
             self.subscribers.add(writer)
@@ -4787,6 +6160,7 @@ class StateFile:
             "plugins": [p.name for p in d.available_plugins()],
             "pairing": d.pairing.state(),
             "devices": [d.device_entry(r) for r in d.devices.devices.values()],
+            "desktop": d.plugins["desktop"].state() if "desktop" in d.plugins else None,
         }
 
     def changed(self):
@@ -4816,6 +6190,7 @@ class StateFile:
         snap = self.snapshot()
         snap["running"] = False
         snap["pairing"] = None
+        snap["desktop"] = None
         for dev in snap["devices"]:
             dev["connected"] = False
             dev["plugins"] = []
@@ -4965,6 +6340,7 @@ class Daemon:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, stop.set)
             loop.add_signal_handler(signal.SIGHUP, self.reload)
+            self.spawn(self.plugins["desktop"].clean_stale())
             self.state.changed()
             names = ", ".join(p.name for p in self.available_plugins())
             log(f"ionix-link {VERSION} on port {self.paths.port} as \"{self.host_name()}\", "
@@ -4981,6 +6357,12 @@ class Daemon:
             server.close()
         if udp is not None:
             udp.close()
+        desktop = self.plugins.get("desktop")
+        if desktop is not None and desktop.desktop is not None:
+            try:
+                await asyncio.wait_for(desktop.close_desktop("shutdown"), 15)
+            except TimeoutError:
+                log("The phone desktop did not close within 15 s.")
         conns = list(self.connections.values()) + list(self.unready)
         if conns:
             sends = [c.send_error(LinkError(ERR_SHUTDOWN, "The desktop's Ionix Link is stopping.")) for c in conns]
@@ -5067,6 +6449,9 @@ class Daemon:
         self.config = load_config(self.paths)
         commands = self.plugins["commands"]
         commands.load()
+        desktop = self.plugins["desktop"]
+        if desktop.desktop is not None and not desktop.available():
+            self.spawn(desktop.close_desktop("desktop"))
         self.spawn(commands.broadcast("commands.changed", {}))
         self.state.changed()
         log("Reloaded config.json and commands.json.")
@@ -5104,12 +6489,13 @@ Commands:
   ring <DEVICE>                   Make a phone ring
   send-clipboard [DEVICE] [TEXT]  Send TEXT, or this desktop's clipboard, to a phone
   commands                        List the commands phones can run
+  desktop [close]                 Show the phone desktop, or close it
   daemon                          Run the daemon (systemd does this: ionix-link.service)
   help [command]                  Show this, or one command's usage
   version                         Show the version
 
 Flags:
-  -j, --json                      Machine-readable output (status, devices, commands)
+  -j, --json                      Machine-readable output (status, devices, commands, desktop)
   -y, --yes                       Do not ask (unpair, pair accept)
       --trace                     Print stack traces on errors
 
@@ -5128,6 +6514,9 @@ USAGE = {
     "ring": ("Make a phone ring at full volume until it is found.", "ionix-link ring <DEVICE>", []),
     "send-clipboard": ("Send text to a phone's clipboard.", "ionix-link send-clipboard [DEVICE] [TEXT]", []),
     "commands": ("List the commands phones can run (built-ins and commands.json).", "ionix-link commands [-j]", ["-j, --json   JSON output"]),
+    "desktop": ("Show the phone desktop (a monitor of a phone's own, opened from the app), or close it. The windows "
+                "on it move to the focused monitor.", "ionix-link desktop [status|close] [-j]",
+                ["-j, --json   JSON output"]),
     "daemon": ("Run the daemon in the foreground.", "ionix-link daemon", []),
 }
 USAGE["list"] = USAGE["ls"] = USAGE["devices"]
@@ -5279,6 +6668,8 @@ def cmd_status(args):
         else:
             print(f"\nA pairing QR code is open ({left // 60}:{left % 60:02d} left).")
     devices = state.get("devices", [])
+    if isinstance(state.get("desktop"), dict):
+        print("\n" + _desktop_line(state["desktop"], devices))
     if not devices:
         print("\nNo paired phones. Run \"ionix-link pair\" to pair one.")
         return EXIT_OK
@@ -5429,6 +6820,43 @@ def cmd_commands(args):
     return EXIT_OK
 
 
+def _desktop_line(desktop, devices):
+    """One sentence about the phone desktop of state.json's `desktop`."""
+    owner = next((d.get("name") for d in devices if d.get("id") == desktop.get("device")), None) or "A phone"
+    line = (f"{owner} has a phone desktop: {desktop.get('output')}, {desktop.get('width')}x{desktop.get('height')} "
+            f"at scale {desktop.get('scale'):g} ({desktop.get('logicalWidth')}x{desktop.get('logicalHeight')} logical)")
+    if not desktop.get("connected"):
+        left = max(0, (desktop.get("graceEnds", 0) - now_ms()) // 1000)
+        line += f", disconnected, closing in {left} s unless it comes back"
+    return line + "."
+
+
+def cmd_desktop(args):
+    positionals, flags = parse_flags(args, {"json": "j"})
+    action = positionals[0] if positionals else "status"
+    if action not in ("status", "close") or len(positionals) > 1:
+        raise UsageError(f"Unknown desktop argument: {' '.join(positionals)}")
+    if action == "close":
+        closed = control_request("desktop.close").get("closed", False)
+        if flags.get("json"):
+            _print_json({"closed": closed})
+        else:
+            print("Closed the phone desktop." if closed else "No phone desktop is open.")
+        return EXIT_OK
+    state = control_request("status")
+    desktop = state.get("desktop")
+    if flags.get("json"):
+        _print_json(desktop)
+        return EXIT_OK
+    if not isinstance(desktop, dict):
+        print("No phone desktop is open. Open one from the app's Desktop page.")
+        return EXIT_OK
+    print(_desktop_line(desktop, state.get("devices", [])))
+    print(f"Touch: {'yes' if desktop.get('touch') else 'no'}. Keyboard: "
+          f"{'through the input method' if desktop.get('ime') else 'typed with wtype'}.")
+    return EXIT_OK
+
+
 def cmd_daemon(args):
     parse_flags(args, {})
     asyncio.run(Daemon().run())
@@ -5461,6 +6889,7 @@ COMMANDS = {
     "ring": cmd_ring,
     "send-clipboard": cmd_send_clipboard,
     "commands": cmd_commands,
+    "desktop": cmd_desktop,
     "daemon": cmd_daemon,
     "help": cmd_help,
     "-h": cmd_help,

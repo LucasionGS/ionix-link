@@ -244,7 +244,8 @@ class _ScreenPageState extends State<ScreenPage> with WidgetsBindingObserver {
 
   Future<void> _loadOutputs() async {
     try {
-      final outputs = await _screen.outputs();
+      // A phone's own desktop is the Phone desktop page's, not a screen to look at.
+      final outputs = [for (final o in await _screen.outputs()) if (!o.virtual) o];
       if (!mounted) return;
       setState(() {
         _outputs = outputs;

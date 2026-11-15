@@ -14,6 +14,7 @@ export "models/plugin_info.dart";
 export "models/ready_info.dart";
 export "plugins/clipboard_client.dart";
 export "plugins/commands_client.dart";
+export "plugins/desktop_client.dart";
 export "plugins/input_client.dart";
 export "plugins/media_client.dart";
 export "plugins/notifications_client.dart";

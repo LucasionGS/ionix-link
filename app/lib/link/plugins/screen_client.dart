@@ -32,6 +32,9 @@ class ScreenClient extends PluginClient {
   /// Daemon cap: H.264 video (`screen.start` with `format: "h264"`).
   static const String capH264 = "h264";
 
+  /// Daemon cap: `screen.start` accepts `scale` up to 4.0 and `maxFps` up to 60.
+  static const String capHires = "hires";
+
   /// `screen.start` formats.
   static const String formatJpeg = "jpeg";
   static const String formatH264 = "h264";
@@ -55,15 +58,18 @@ class ScreenClient extends PluginClient {
   /// Whether the desktop can stream video.
   bool get canVideo => hasCap(capH264);
 
+  /// Whether the desktop accepts the wider `scale` and `maxFps` ranges.
+  bool get canHires => hasCap(capHires);
+
   /// The desktop's outputs.
   Future<List<ScreenOutput>> outputs() async {
     return List.unmodifiable(JsonRead.objects(await request(typeOutputs), "outputs", ScreenOutput.fromJson));
   }
 
   /// Start (or restart with new values) a stream of [output].
-  /// @param scale Fraction of the logical size, 0.1..1.0.
+  /// @param scale Fraction of the logical size, 0.1..1.0; up to 4.0 with [canHires] (the frame is never larger than the output's pixels).
   /// @param quality JPEG quality, 1..100; for video it sets the default bitrate.
-  /// @param maxFps Upper bound on frames per second, 1..30.
+  /// @param maxFps Upper bound on frames per second, 1..30; up to 60 with [canHires].
   /// @param format [formatJpeg] (frames on [frames]) or [formatH264] (access units on [video]; needs [canVideo]).
   /// @param bitrate Video bits per second, 100 000..50 000 000; the desktop picks one from the size when null.
   /// @throws LinkRemoteException with `invalid_argument` for an unknown output, a value out of range, or video the
@@ -231,6 +237,7 @@ class ScreenOutput {
     required this.height,
     required this.scale,
     required this.focused,
+    this.virtual = false,
   });
 
   /// Output name (`DP-1`), the handle for [ScreenClient.start] and [InputClient.moveAbsolute].
@@ -242,6 +249,9 @@ class ScreenOutput {
   final int height;
   final double scale;
   final bool focused;
+
+  /// A monitor made for a phone (`desktop` plugin). The ordinary screen picker leaves these out.
+  final bool virtual;
 
   /// Throws [LinkFormatException] on a missing `name` or size.
   static ScreenOutput fromJson(Map<String, dynamic> json) {
@@ -256,6 +266,7 @@ class ScreenOutput {
       height: JsonRead.integer(json, "height"),
       scale: JsonRead.optNumber(json, "scale") ?? 1.0,
       focused: JsonRead.optBool(json, "focused") ?? false,
+      virtual: JsonRead.optBool(json, "virtual") ?? false,
     );
   }
 }

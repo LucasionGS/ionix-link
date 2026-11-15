@@ -3,6 +3,7 @@ import "package:material_ui/material_ui.dart";
 import "../link/link.dart";
 import "pages/clipboard_page.dart";
 import "pages/commands_page.dart";
+import "pages/desktop_page.dart";
 import "pages/input_page.dart";
 import "pages/media_page.dart";
 import "pages/notifications_page.dart";
@@ -16,6 +17,7 @@ class PluginPageSpec {
     required this.description,
     required this.icon,
     required this.builder,
+    this.offered,
   });
 
   /// Plugin name ([LinkPlugins]); the tile shows only while the plugin is negotiated on the connection.
@@ -32,6 +34,13 @@ class PluginPageSpec {
 
   /// Builds the plugin's page.
   final WidgetBuilder builder;
+
+  /// Extra condition on what the desktop negotiated before the tile shows (the plugin itself must be there too),
+  /// for a page that needs more than its own plugin, like the Phone desktop's video. Null = the plugin is enough.
+  final bool Function(List<PluginInfo> plugins)? offered;
+
+  /// Whether the tile shows for the plugins negotiated on the current connection.
+  bool isOffered(List<PluginInfo> plugins) => plugins.any((p) => p.name == plugin) && (offered?.call(plugins) ?? true);
 }
 
 /// The plugin page registry. The dashboard renders one tile per entry, in order. **A new plugin's page is one entry
@@ -39,8 +48,8 @@ class PluginPageSpec {
 class PluginPages {
   PluginPages._();
 
-  /// Every plugin page: media, commands, input, screen, clipboard, notifications. (`status` has no page: its data
-  /// is on the dashboard header.)
+  /// Every plugin page: media, commands, input, screen, desktop, clipboard, notifications. (`status` has no page: its
+  /// data is on the dashboard header.)
   static List<PluginPageSpec> get all => _all;
 
   /// The spec of [plugin], or null.
@@ -86,6 +95,20 @@ class PluginPages {
       description: "See and tap your desktop",
       icon: Icons.desktop_windows_outlined,
       builder: (_) => const ScreenPage(),
+    ),
+    PluginPageSpec(
+      plugin: LinkPlugins.desktop,
+      title: "Phone desktop",
+      description: "Your desktop as a phone screen",
+      icon: Icons.smartphone_rounded,
+      builder: (_) => const DesktopPage(),
+      // The picture is worth showing only as sharp, fast video.
+      offered: (plugins) {
+        for (final plugin in plugins) {
+          if (plugin.name == LinkPlugins.screen) return plugin.has(ScreenClient.capH264) && plugin.has(ScreenClient.capHires);
+        }
+        return false;
+      },
     ),
     PluginPageSpec(
       plugin: LinkPlugins.media,

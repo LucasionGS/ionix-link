@@ -1,0 +1,6 @@
+# Ionix Link's phone desktop is touched through a uinput touchscreen the daemon
+# makes as the logged-in user. uaccess gives the user on the active seat (and
+# only them) /dev/uinput; static_node makes the node exist before the uinput
+# module loads, so opening it loads the module. Ordered before 73-seat-late.rules,
+# which turns the uaccess tag into the ACL.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

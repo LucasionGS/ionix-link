@@ -11,6 +11,7 @@ Switches, as files in STATE_DIR checked on every use:
   window-closed   tokenless pair.request gets pair.reject {reason: "not_open"}
   forge-announce  each discovery query is first answered by an announce with a wrong fingerprint
   forge-only      ... and only by that one
+  desktop-busy    desktop.open gets error busy (another phone has the desktop)
 debug.* requests (after ready) drive the rest of the test: stats, theme, drop, close, forget, unpair, ring.
 """
 import asyncio
@@ -50,14 +51,16 @@ FP = FP_RAW.hex()
 HOST_ID = secrets.token_hex(16)
 HOST_NAME = "fakeix"
 DAEMON_CAPS = {"notifications": ["dismiss", "phone"], "media": ["players", "volume", "art"], "commands": [], "clipboard": [],
-               "input": ["pointer", "keyboard"], "screen": ["jpeg", "h264"], "status": ["volume"], "theme": ["wallpaper"],
-               "share": ["text", "files"]}
+               "input": ["pointer", "keyboard"], "screen": ["jpeg", "h264", "hires"], "status": ["volume"], "theme": ["wallpaper"],
+               "share": ["text", "files"], "desktop": ["touch", "ime", "nav"]}
 WALLPAPER = bytes.fromhex("ffd8ffe0") + b"fake wallpaper" * 8000 + bytes.fromhex("ffd9")  # > 64 KiB on purpose
 devices = {}  # deviceId -> key bytes
 token = {"value": secrets.token_hex(16)}
 stats = {"moves": 0, "dx": 0.0, "dy": 0.0, "scrolls": 0, "buttons": [], "acks": [], "clipboard": None,
          "battery": None, "ring": None, "connections": 0, "hellos": 0, "queries": [], "phone": [], "notificationCaps": None,
-         "share": {"texts": [], "files": [], "cancelled": 0}}
+         "share": {"texts": [], "files": [], "cancelled": 0},
+         "desktop": {"opens": [], "closes": 0, "touches": [], "commits": [], "navs": []}}
+desktop = {"open": None}  # the one desktop: {width, height, scale, owner}; survives a reconnect, as in PROTOCOL.md 8.11
 uploads = {}  # share transfer id -> {name, size, got, hash}
 theme = {"accent": "#9b59b6"}
 live = {}  # deviceId -> Conn
@@ -304,8 +307,38 @@ class Conn:
       if uploads.pop(body["transfer"], None) is not None: stats["share"]["cancelled"] += 1
       reply({})
     elif typ == "screen.outputs":
-      reply({"outputs": [{"name": "HEADLESS-1", "description": "Fake", "x": 0, "y": 0, "width": 1920, "height": 1080,
-                          "scale": 1.0, "focused": True}]})
+      outputs = [{"name": "HEADLESS-1", "description": "Fake", "x": 0, "y": 0, "width": 1920, "height": 1080,
+                  "scale": 1.0, "focused": True}]
+      if desktop["open"]:
+        d = desktop["open"]
+        outputs.append({"name": "IONIX-LINK-1", "description": "Phone", "x": 10000, "y": 0, "width": int(d["width"] / d["scale"]),
+                        "height": int(d["height"] / d["scale"]), "scale": d["scale"], "focused": False, "virtual": True})
+      reply({"outputs": outputs})
+    elif typ == "desktop.open":
+      stats["desktop"]["opens"].append(body)
+      if flag("desktop-busy"):
+        self.error("busy", "Another phone has the desktop.", re=mid)
+      else:
+        created = desktop["open"] is None
+        desktop["open"] = {"width": body["width"], "height": body["height"], "scale": body["scale"]}
+        reply({"output": "IONIX-LINK-1", "width": body["width"], "height": body["height"], "scale": body["scale"],
+               "logicalWidth": int(body["width"] / body["scale"]), "logicalHeight": int(body["height"] / body["scale"]),
+               "created": created})
+    elif typ == "desktop.close":
+      desktop["open"] = None
+      stats["desktop"]["closes"] += 1
+      reply({})
+    elif typ == "desktop.touch":
+      stats["desktop"]["touches"].append(body["touches"])
+    elif typ == "desktop.commit":
+      stats["desktop"]["commits"].append(body)
+    elif typ == "desktop.nav":
+      stats["desktop"]["navs"].append(body["action"])
+    elif typ == "debug.desktopClosed":
+      desktop["open"] = None
+      reply({"ok": True}); self.send("desktop.closed", {"reason": body.get("reason", "desktop")})
+    elif typ == "debug.textInput":
+      reply({"ok": True}); self.send("desktop.textInput", body)
     elif typ == "screen.start" and body.get("format") == "h264":
       self.seq, self.format = 0, "h264"
       stats["videoStart"] = body

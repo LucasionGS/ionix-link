@@ -15,6 +15,7 @@ import "models/link_theme.dart";
 import "models/plugin_info.dart";
 import "plugins/clipboard_client.dart";
 import "plugins/commands_client.dart";
+import "plugins/desktop_client.dart";
 import "plugins/input_client.dart";
 import "plugins/media_client.dart";
 import "plugins/notifications_client.dart";
@@ -63,12 +64,13 @@ class Link {
   static final ScreenClient screen = ScreenClient();
   static final StatusClient status = StatusClient();
   static final ShareClient share = ShareClient();
+  static final DesktopClient desktop = DesktopClient();
 
   /// The desktop's theme. Usable before [init] finishes and with nothing paired: it then holds [LinkTheme.ionix].
   static final ThemeClient theme = ThemeClient();
 
   /// Every plugin client, in the order their descriptors go into `hello`. **A new plugin is added here.**
-  static final List<PluginClient> clients = [notifications, media, commands, clipboard, input, screen, status, theme, share];
+  static final List<PluginClient> clients = [notifications, media, commands, clipboard, input, screen, status, theme, share, desktop];
 
   /// Load the store, build the identity and, if a current host is stored, start connecting to it.
   /// @param platformName The phone's name from the platform (used unless the user set one).

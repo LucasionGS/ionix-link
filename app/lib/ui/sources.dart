@@ -17,6 +17,7 @@ class UiSources {
   static InputSource input = LinkInputSource();
   static ScreenSource screen = LinkScreenSource();
   static ShareSource share = LinkShareSource();
+  static DesktopSource desktop = LinkDesktopSource();
 }
 
 //#region Theme
@@ -342,13 +343,16 @@ class ScreenAwake {
 /// The screen plugin.
 abstract class ScreenSource {
   Future<List<ScreenOutput>> outputs();
-  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15, String format = ScreenClient.formatJpeg});
+  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15, String format = ScreenClient.formatJpeg, int? bitrate});
   Future<void> stop();
   void ack(int seq);
   Stream<ScreenFrame> get frames;
 
   /// Whether the desktop can stream H.264 video.
   bool get canVideo;
+
+  /// Whether the desktop accepts `scale` up to 4.0 and `maxFps` up to 60.
+  bool get canHires;
 
   /// Video access units, for a stream started with [ScreenClient.formatH264].
   Stream<ScreenVideoUnit> get video;
@@ -362,8 +366,8 @@ class LinkScreenSource extends ScreenSource {
   Future<List<ScreenOutput>> outputs() => Link.screen.outputs();
 
   @override
-  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15, String format = ScreenClient.formatJpeg}) {
-    return Link.screen.start(output, scale: scale, quality: quality, maxFps: maxFps, format: format);
+  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15, String format = ScreenClient.formatJpeg, int? bitrate}) {
+    return Link.screen.start(output, scale: scale, quality: quality, maxFps: maxFps, format: format, bitrate: bitrate);
   }
 
   @override
@@ -379,6 +383,9 @@ class LinkScreenSource extends ScreenSource {
   bool get canVideo => Link.screen.canVideo;
 
   @override
+  bool get canHires => Link.screen.canHires;
+
+  @override
   Stream<ScreenVideoUnit> get video => Link.screen.video;
 
   @override
@@ -386,6 +393,89 @@ class LinkScreenSource extends ScreenSource {
 
   @override
   Stream<String> get stopped => Link.screen.stopped;
+}
+
+//#endregion
+
+//#region Desktop
+
+/// The desktop plugin: the phone's own monitor on the desktop, its touch input and its keyboard.
+abstract class DesktopSource {
+  /// Whether the desktop can take touch input.
+  bool get hasTouch;
+
+  /// Whether the desktop's input method is available (`desktop.textInput` and `desktop.commit`).
+  bool get hasIme;
+
+  /// Whether the desktop's shell answers `back`, `home` and `overview`.
+  bool get hasNav;
+
+  Future<DesktopInfo> open({required int width, required int height, required double scale, int refresh = 60});
+  Future<void> close();
+  void touch(List<DesktopTouch> touches);
+  void commit({String? text, int deleteBefore = 0});
+  void nav(String action);
+
+  /// Reasons of `desktop.closed`.
+  Stream<String> get closed;
+
+  /// The focused text field on the phone's desktop, null while none.
+  ValueListenable<DesktopTextInput?> get textInput;
+
+  /// Persisted: room given to windows, 1.0..2.0 (bigger = smaller elements).
+  double get uiSize;
+  Future<void> setUiSize(double size);
+
+  /// Persisted: the side and place along it of the page's handle.
+  ({bool right, double pos}) get handle;
+  Future<void> setHandle({required bool right, required double pos});
+}
+
+/// [DesktopSource] over [Link.desktop].
+class LinkDesktopSource extends DesktopSource {
+  @override
+  bool get hasTouch => Link.desktop.hasTouch;
+
+  @override
+  bool get hasIme => Link.desktop.hasIme;
+
+  @override
+  bool get hasNav => Link.desktop.hasNav;
+
+  @override
+  Future<DesktopInfo> open({required int width, required int height, required double scale, int refresh = 60}) {
+    return Link.desktop.open(width: width, height: height, scale: scale, refresh: refresh);
+  }
+
+  @override
+  Future<void> close() => Link.desktop.close();
+
+  @override
+  void touch(List<DesktopTouch> touches) => Link.desktop.touch(touches);
+
+  @override
+  void commit({String? text, int deleteBefore = 0}) => Link.desktop.commit(text: text, deleteBefore: deleteBefore);
+
+  @override
+  void nav(String action) => Link.desktop.nav(action);
+
+  @override
+  Stream<String> get closed => Link.desktop.closed;
+
+  @override
+  ValueListenable<DesktopTextInput?> get textInput => Link.desktop.textInput;
+
+  @override
+  double get uiSize => Link.store.desktopUiSize;
+
+  @override
+  Future<void> setUiSize(double size) => Link.store.setDesktopUiSize(size);
+
+  @override
+  ({bool right, double pos}) get handle => Link.store.desktopHandle;
+
+  @override
+  Future<void> setHandle({required bool right, required double pos}) => Link.store.setDesktopHandle(right: right, pos: pos);
 }
 
 //#endregion

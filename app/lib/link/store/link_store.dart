@@ -16,7 +16,8 @@ import "../protocol/link_crypto.dart";
 ///
 /// ```json
 /// { "version": 1, "deviceId": "<hex32>", "deviceName": "Pixel 8"?, "currentHost": "<hostId>"?, "hosts": [PairedHost],
-///   "themes": { "<hostId>": Theme }, "wallpapers": { "<hostId>": "<hash>" } }
+///   "themes": { "<hostId>": Theme }, "wallpapers": { "<hostId>": "<hash>" },
+///   "desktop": { "uiSize": 1.5, "handleRight": false, "handlePos": 0.35 }? }
 /// ```
 ///
 /// A fetched wallpaper is kept next to it as `wallpaper-<hostId>.jpg`. Writes are atomic (temp file + rename) and run
@@ -96,6 +97,36 @@ class LinkStore {
   String? get deviceName {
     final name = _data["deviceName"];
     return name is String && name.trim().isNotEmpty ? name : null;
+  }
+
+  /// How much room the Phone desktop gives its windows: 1.0..2.0, bigger = more room and smaller elements. Default 1.5.
+  double get desktopUiSize {
+    final value = (_data["desktop"] as Map?)?["uiSize"];
+    return value is num ? value.toDouble().clamp(1.0, 2.0) : 1.5;
+  }
+
+  Future<void> setDesktopUiSize(double size) => _setDesktop("uiSize", size.clamp(1.0, 2.0));
+
+  /// Where the Phone desktop's handle sits: the side and how far down (0..1) along it.
+  ({bool right, double pos}) get desktopHandle {
+    final desktop = _data["desktop"] as Map?;
+    final pos = desktop?["handlePos"];
+    return (right: desktop?["handleRight"] == true, pos: pos is num ? pos.toDouble().clamp(0.0, 1.0) : 0.35);
+  }
+
+  Future<void> setDesktopHandle({required bool right, required double pos}) async {
+    final desktop = Map<String, dynamic>.of((_data["desktop"] as Map?)?.cast<String, dynamic>() ?? const {});
+    desktop["handleRight"] = right;
+    desktop["handlePos"] = pos.clamp(0.0, 1.0);
+    _data["desktop"] = desktop;
+    await _save();
+  }
+
+  Future<void> _setDesktop(String key, Object value) {
+    final desktop = Map<String, dynamic>.of((_data["desktop"] as Map?)?.cast<String, dynamic>() ?? const {});
+    desktop[key] = value;
+    _data["desktop"] = desktop;
+    return _save();
   }
 
   /// Set or clear (null) the chosen phone name.

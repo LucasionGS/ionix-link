@@ -126,4 +126,5 @@ class LinkPlugins {
   static const String status = "status";
   static const String theme = "theme";
   static const String share = "share";
+  static const String desktop = "desktop";
 }

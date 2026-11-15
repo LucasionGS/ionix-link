@@ -29,8 +29,11 @@ final PairedHost fakeSecondHost = PairedHost(
 );
 
 List<PluginInfo> fakePlugins() => [
-      for (final name in [LinkPlugins.notifications, LinkPlugins.media, LinkPlugins.commands, LinkPlugins.clipboard, LinkPlugins.input, LinkPlugins.screen, LinkPlugins.status])
+      for (final name in [LinkPlugins.notifications, LinkPlugins.media, LinkPlugins.commands, LinkPlugins.clipboard, LinkPlugins.input, LinkPlugins.status])
         PluginInfo(name: name, version: 1),
+      // The Phone desktop's tile needs the desktop plugin and video in the hires range.
+      PluginInfo(name: LinkPlugins.screen, version: 1, caps: const [ScreenClient.capJpeg, ScreenClient.capH264, ScreenClient.capHires]),
+      PluginInfo(name: LinkPlugins.desktop, version: 1, caps: const [DesktopClient.capTouch, DesktopClient.capIme, DesktopClient.capNav]),
     ];
 
 final List<DesktopNotification> fakeNotifications = [
@@ -216,6 +219,12 @@ class FakeScreenSource extends ScreenSource {
   final ValueNotifier<ScreenStreamInfo?> stream = ValueNotifier(null);
   Uint8List? _picture;
 
+  /// The Phone desktop's fake, whose last open decides the size and look of a picture of `IONIX-LINK-1`.
+  FakeDesktopSource? desktop;
+
+  /// Streams started with `scale: 4.0`, to show that the desktop page asks for the hires range.
+  final List<({String output, double scale, int maxFps, String format, int? bitrate})> startCalls = [];
+
   /// How many times the page started or stopped the stream, to show that a fold does neither.
   int starts = 0;
   int stops = 0;
@@ -227,12 +236,22 @@ class FakeScreenSource extends ScreenSource {
       ];
 
   @override
-  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15, String format = ScreenClient.formatJpeg}) async {
+  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15, String format = ScreenClient.formatJpeg, int? bitrate}) async {
     starts++;
-    final info = ScreenStreamInfo(output: output, width: 1280, height: 720);
+    startCalls.add((output: output, scale: scale, maxFps: maxFps, format: format, bitrate: bitrate));
+    final phone = output.startsWith("IONIX-LINK-") ? desktop?.lastOpen : null;
+    final width = phone?.width ?? 1280;
+    final height = phone?.height ?? 720;
+    final info = ScreenStreamInfo(output: output, width: width, height: height);
     stream.value = info;
-    _picture ??= await _drawDesktop();
-    Timer(const Duration(milliseconds: 150), () => _frames.add(ScreenFrame(output: output, width: 1280, height: 720, seq: 1, format: "jpeg", time: DateTime.now(), bytes: _picture!)));
+    final Uint8List picture;
+    if (phone != null) {
+      picture = await _drawPhoneDesktop(width, height, phone.scale);
+    }
+    else {
+      picture = _picture ??= await _drawDesktop();
+    }
+    Timer(const Duration(milliseconds: 150), () => _frames.add(ScreenFrame(output: output, width: width, height: height, seq: 1, format: "jpeg", time: DateTime.now(), bytes: picture)));
     return info;
   }
 
@@ -252,11 +271,45 @@ class FakeScreenSource extends ScreenSource {
   @override
   bool get canVideo => false;
 
+  // The desktop page asks for the hires range; this fake accepts it and answers with JPEG frames all the same.
+  @override
+  bool get canHires => true;
+
   @override
   Stream<ScreenVideoUnit> get video => const Stream.empty();
 
   @override
   Stream<String> get stopped => const Stream.empty();
+
+  /// A made-up phone desktop of [width]×[height] px at [scale]: wallpaper, a status bar, one full-screen window and a
+  /// navigation pill, drawn from a 400-wide logical layout, as PNG bytes.
+  static Future<Uint8List> _drawPhoneDesktop(int width, int height, double scale) async {
+    final recorder = ui.PictureRecorder();
+    final canvas = ui.Canvas(recorder);
+    final w = width.toDouble();
+    final h = height.toDouble();
+    final u = scale * 1.5; // one logical unit of the desktop, in px
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, w, h),
+      Paint()..shader = ui.Gradient.linear(Offset.zero, Offset(w, h), const [Color(0xFF1B1030), Color(0xFF5B2A86), Color(0xFF14325C)], const [0.0, 0.5, 1.0]),
+    );
+    final window = RRect.fromRectAndRadius(Rect.fromLTWH(0, 28 * u, w, h - 28 * u - 22 * u), Radius.zero);
+    canvas.drawRRect(window, Paint()..color = const Color(0xFF1A1025));
+    canvas.drawRect(Rect.fromLTWH(0, 28 * u, w, 44 * u), Paint()..color = const Color(0xFF2D2D3F));
+    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(12 * u, 40 * u, w * 0.5, 20 * u), Radius.circular(10 * u)), Paint()..color = const Color(0x33FFFFFF));
+    for (var i = 0; i < 9; i++) {
+      final top = 90 * u + i * 34 * u;
+      if (top + 20 * u > h - 40 * u) break;
+      canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(14 * u, top, w - 28 * u, 24 * u), Radius.circular(8 * u)), Paint()..color = Color(i.isEven ? 0x22FFFFFF : 0x14FFFFFF));
+    }
+    canvas.drawRect(Rect.fromLTWH(0, 0, w, 28 * u), Paint()..color = const Color(0xCC0F0A18));
+    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(12 * u, 9 * u, 46 * u, 10 * u), Radius.circular(5 * u)), Paint()..color = const Color(0x88FFFFFF));
+    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(w - 70 * u, 9 * u, 58 * u, 10 * u), Radius.circular(5 * u)), Paint()..color = const Color(0x88FFFFFF));
+    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromCenter(center: Offset(w / 2, h - 11 * u), width: 120 * u, height: 5 * u), Radius.circular(3 * u)), Paint()..color = const Color(0xCCFFFFFF));
+    final image = await recorder.endRecording().toImage(width, height);
+    final data = await image.toByteData(format: ui.ImageByteFormat.png);
+    return data!.buffer.asUint8List();
+  }
 
   /// A made-up desktop: wallpaper, a bar and two windows, as PNG bytes.
   static Future<Uint8List> _drawDesktop() async {
@@ -284,6 +337,79 @@ class FakeScreenSource extends ScreenSource {
     final data = await image.toByteData(format: ui.ImageByteFormat.png);
     return data!.buffer.asUint8List();
   }
+}
+
+/// The Phone desktop's fake: records what the page sends, answers `open` the way a daemon would.
+class FakeDesktopSource extends DesktopSource {
+  FakeDesktopSource({this.failWith});
+
+  /// `busy`: every open is refused as another phone's.
+  final String? failWith;
+
+  final StreamController<String> _closed = StreamController.broadcast();
+
+  /// Every `desktop.open`, in order.
+  final List<({int width, int height, double scale})> opens = [];
+
+  /// Every touch set sent, in order.
+  final List<List<DesktopTouch>> touches = [];
+  final List<String> navs = [];
+  final List<({String? text, int deleteBefore})> commits = [];
+  int closes = 0;
+  double _uiSize = 1.5;
+  ({bool right, double pos}) _handle = (right: false, pos: 0.35);
+
+  @override
+  final ValueNotifier<DesktopTextInput?> textInput = ValueNotifier(null);
+
+  ({int width, int height, double scale})? get lastOpen => opens.isEmpty ? null : opens.last;
+
+  /// Push `desktop.closed`.
+  void pushClosed(String reason) => _closed.add(reason);
+
+  @override
+  bool get hasTouch => true;
+
+  @override
+  bool get hasIme => true;
+
+  @override
+  bool get hasNav => true;
+
+  @override
+  Future<DesktopInfo> open({required int width, required int height, required double scale, int refresh = 60}) async {
+    opens.add((width: width, height: height, scale: scale));
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+    if (failWith == "busy") throw LinkRemoteException("Another phone has the desktop.", code: LinkErrorCode.busy);
+    return DesktopInfo(output: "IONIX-LINK-1", width: width, height: height, scale: scale, logicalWidth: (width / scale).round(), logicalHeight: (height / scale).round(), created: opens.length == 1);
+  }
+
+  @override
+  Future<void> close() async => closes++;
+
+  @override
+  void touch(List<DesktopTouch> touches) => this.touches.add(touches);
+
+  @override
+  void commit({String? text, int deleteBefore = 0}) => commits.add((text: text, deleteBefore: deleteBefore));
+
+  @override
+  void nav(String action) => navs.add(action);
+
+  @override
+  Stream<String> get closed => _closed.stream;
+
+  @override
+  double get uiSize => _uiSize;
+
+  @override
+  Future<void> setUiSize(double size) async => _uiSize = size;
+
+  @override
+  ({bool right, double pos}) get handle => _handle;
+
+  @override
+  Future<void> setHandle({required bool right, required double pos}) async => _handle = (right: right, pos: pos);
 }
 
 class FakeCode extends CodeAttempt {

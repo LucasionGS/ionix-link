@@ -275,13 +275,14 @@ mac    7c0ad5f413446203954a9262d09fd5a3df91edb941f35deaf0d44a1a23eb09a3
 | `auth_failed` | yes | Bad `mac`. |
 | `rate_limited` | yes | Too many auth failures. |
 | `replaced` | yes | Another connection authenticated for this device. The phone waits at least 30 s before reconnecting, so two copies of the app never take the connection from each other in a loop. |
-| `plugin_unavailable` | no | Request for a plugin not negotiated on this connection. |
+| `plugin_unavailable` | no | Request for a plugin not negotiated on this connection, or one switched off since it was (8.11: `desktop.open` after `plugins.desktop` was set false). |
 | `invalid_argument` | no | A body field has a bad value (unknown output, scale out of range…). |
 | `not_found` | no | Named thing does not exist (command id, player, notification). |
 | `busy` | no | Already doing it (a second `screen.start` on another output is *not* busy: it restarts). |
 | `timeout` | no | The desktop-side action timed out. |
 | `failed` | no | The action ran and failed (tool exit status non-zero). `details.exitCode` when known. |
 | `internal` | no | Bug in the receiver. |
+| `unavailable` | no | The desktop could not make what was asked for (8.11: the phone desktop's output). |
 | `shutdown` | yes | The daemon is stopping. |
 
 ## 8. Plugins
@@ -388,26 +389,26 @@ Caps: `pointer` (the daemon's virtual pointer bound `zwlr_virtual_pointer_manage
 
 ### 8.6 `screen`
 
-Caps: `jpeg` (always), `h264` (video; the desktop has `wf-recorder` and a usable encoder). Desktop needs `grim` plus `hyprctl` or `wlr-randr` for outputs.
+Caps: `jpeg` (always), `h264` (video; the desktop has `wf-recorder` and a usable encoder), `hires` (accepts the wider `scale` and `maxFps` ranges of `screen.start`). Desktop needs `grim` plus `hyprctl` or `wlr-randr` for outputs.
 
-`Output` object: `name: str` (`DP-1`) · `description: str` · `x: int` · `y: int` · `width: int` · `height: int` (logical px, layout coordinates) · `scale: float` · `focused: bool`.
+`Output` object: `name: str` (`DP-1`) · `description: str` · `x: int` · `y: int` · `width: int` · `height: int` (logical px, layout coordinates) · `scale: float` · `focused: bool` · `virtual: bool` (a phone desktop's own output, 8.11; an older daemon leaves it out, which means `false`).
 
 | Type | Dir | Kind | Body |
 |---|---|---|---|
 | `screen.outputs` | P→D | request | `{}` → reply `outputs: [Output]` |
-| `screen.start` | P→D | request | `output: str` · `scale: float` (0.1..1.0, of the logical size) · `quality: int` (1..100) · `maxFps: int` (1..30) · `format: str?` — `jpeg` (default) \| `h264` · `bitrate: int?` (h264 only, bits/s, 100 000..50 000 000) → reply `width: int` · `height: int` (frame size) · `format: str`. Restarts a running stream with the new values (and may switch format). `invalid_argument` for an unknown output, a value out of range, or `h264` without the cap. |
+| `screen.start` | P→D | request | `output: str` · `scale: float` (0.1..1.0, of the logical size; with cap `hires` up to 4.0, and a frame never larger than the output's pixel size, so 4.0 always means native pixels) · `quality: int` (1..100) · `maxFps: int` (1..30; with cap `hires` 1..60) · `format: str?` — `jpeg` (default) \| `h264` · `bitrate: int?` (h264 only, bits/s, 100 000..50 000 000) → reply `width: int` · `height: int` (frame size) · `format: str`. Restarts a running stream with the new values (and may switch format). `invalid_argument` for an unknown output, a value out of range, or `h264` without the cap. |
 | `screen.frame` | D→P | **binary** push | JPEG streams. Header body: `output: str` · `w: int` · `h: int` · `seq: int` (1, 2, 3… per stream) · `format: "jpeg"` · `time: int` (capture time). Data: the JPEG (`grim -o <output> -s <scale> -t jpeg -q <quality> -c -`). |
 | `screen.video` | D→P | **binary** push | H.264 streams. Header body: `output: str` · `w: int` · `h: int` · `seq: int` (1, 2, 3… per stream, no gaps: dropped frames get no seq) · `format: "h264"` · `keyframe: bool` (an IDR picture) · `pts: int` (ms since the stream started) · `time: int` (when the daemon had the frame). Data: **one access unit** (one frame), Annex-B with 4-byte start codes. |
 | `screen.ack` | P→D | push | `seq: int` — JPEG: sent once the phone has decoded and shown frame `seq`. Video: the newest frame decoded so far (below). |
 | `screen.stop` | P→D | request | `{}` → reply `ok: bool` |
-| `screen.stopped` | D→P | push | `reason: str` — `output_gone` \| `capture_failed` \| `stalled` |
+| `screen.stopped` | D→P | push | `reason: str` — `output_gone` \| `capture_failed` \| `stalled` \| `stopped` (the phone desktop it showed is closing, 8.11) |
 
 JPEG flow control: **one frame in flight**. The daemon sends frame `n+1` only after `screen.ack {seq: n}` and no sooner than `1000 / maxFps` ms after frame `n`. It may capture `n+1` while waiting. No ack within 30 s: the stream stops with `screen.stopped {reason: "stalled"}`. A disconnect stops the stream. A slow link therefore lowers the frame rate, never adds latency.
 
 **Video (`format: "h264"`).** The phone asks for it only when the daemon lists `h264` and the phone has a decoder; an older phone never sends `format` and gets JPEG as before. Start, restart, stop, `screen.stopped` reasons, the 30 s stall and stop-on-disconnect are as for JPEG.
 
-- **Encoder.** `wf-recorder -o <output> -c <encoder> -m h264 -f /dev/stdout -D -r <maxFps>`, scaled to the frame size, no B-frames, GOP `maxFps` frames, `b`/`maxrate` = `bitrate`, VBV half a second. `-D` records at a constant rate even on a still screen, so a keyframe comes every second and a frame every `1000 / maxFps` ms (an unchanged one is a few dozen bytes). Encoders are tried in this order. A hardware one that has never written a frame since the daemon started (or three runs in a row without one) is left out for 10 minutes and then tried again; `libx264` is never left out, because a failure caused by the screen (off, a mode change, a locked session) must not end video for good: `h264_vaapi` (if `/dev/dri/renderD128` exists), `h264_nvenc` (if `/dev/nvidiactl` exists), `libx264` (`preset=ultrafast`, `tune=zerolatency`). `IONIX_LINK_H264_ENCODER` pins one. The encoder runs in its own process group, which is killed (SIGTERM, then SIGKILL after 1 s) when the stream stops. An encoder that exits is restarted on a keyframe; three exits within 10 s each → `capture_failed`. A phone that gets `capture_failed` on a video stream asks again with `format: "jpeg"` and tells the user.
-- **Frame size.** As for JPEG, rounded down to even numbers (4:2:0). Default `bitrate`: `w × h × maxFps × quality × 0.002`, within the limits above.
+- **Encoder.** `wf-recorder -o <output> -c <encoder> -m h264 -f /dev/stdout -D -r <maxFps>`, scaled to the frame size, no B-frames, GOP `maxFps` frames, `b`/`maxrate` = `bitrate`, VBV half a second. `-D` records at a constant rate even on a still screen, so a keyframe comes every second and a frame every `1000 / maxFps` ms (an unchanged one is a few dozen bytes). Encoders are tried in this order. A hardware one that has never written a frame since the daemon started (or three runs in a row without one) is left out for 10 minutes and then tried again; `libx264` is never left out, because a failure caused by the screen (off, a mode change, a locked session) must not end video for good: `h264_nvenc` (if `/dev/nvidiactl` exists; first, because VAAPI on that driver only decodes), `h264_vaapi` (if `/dev/dri/renderD128` exists), `libx264` (`preset=ultrafast`, `tune=zerolatency`). `IONIX_LINK_H264_ENCODER` pins one. The encoder runs in its own process group, which is killed (SIGTERM, then SIGKILL after 1 s) when the stream stops. An encoder that exits is restarted on a keyframe; three exits within 10 s each → `capture_failed`. A phone that gets `capture_failed` on a video stream asks again with `format: "jpeg"` and tells the user.
+- **Frame size.** As for JPEG, rounded down to even numbers (4:2:0). At the output's own pixel size the encoder gets no scale filter, and JPEG frames are taken with `grim -s <the output's scale>`. Default `bitrate`: `w × h × maxFps × quality × 0.002`, within the limits above.
 - **Parameter sets in band.** Every keyframe's access unit holds its SPS and PPS before the IDR slice (the daemon adds the last ones seen if an encoder leaves them out). There is no separate configuration message: the phone (re)configures its decoder from a keyframe whose SPS/PPS or `w`/`h` differ from the last ones, and decodes nothing until the first keyframe of a stream. The first frame of every stream, and of every encoder restart, is a keyframe.
 - **Access units.** The daemon cuts the byte stream into access units on H.264's own boundaries (an AUD, SPS, PPS, SEI or NAL types 14–18 after a slice, or a slice with `first_mb_in_slice` 0 after a slice), and ends the unit being written when the encoder has been quiet for 3 ms: an encoder writes each frame in one burst, so waiting for the next frame's first NAL unit would add a frame of latency.
 - **Flow control.** Frames are sent as they are encoded, without waiting for acks. The phone sends `screen.ack {seq}` with the newest seq it has decoded, **at most every 100 ms**, sooner after a pause (the first decoded frame after 100 ms without an ack goes at once). With `maxLag = max(6, round(0.3 × maxFps))`: when a frame is ready and `lastSentSeq − lastAckedSeq ≥ maxLag`, the daemon **drops** it, and once it has dropped a frame it drops every frame up to the next keyframe that fits under `maxLag` (the frames in between could not be decoded). Frames waiting for the socket count as sent, so at most `maxLag` frames are ever buffered and a slow link lowers the frame rate (down to one keyframe a second), never adds latency. A frame whose message would exceed the 8 MiB frame limit is dropped the same way. The 30 s stall applies to acks: frames in flight and no ack advancing for 30 s → `stalled`.
@@ -489,6 +490,32 @@ Rules:
 - **No loop.** The daemon mirrors desktop notifications to the phone (8.1), so it must not mirror these back. Every notification it posts for a phone carries the hint `x-ionix-link`, and `notifications.posted` is never sent for a `Notify` call that has it, nor for an id the daemon tracks as a phone notification. Closing one (by the user, `phoneRemoved` or a disconnect) is not sent as `notifications.closed` either.
 - The phone sends a `phonePosted` only while the connection is `ready` and the daemon has cap `phone`; the daemon's message limits (section 2) apply, so `title` and `text` are cut by the phone to 512 and 4096 characters.
 
+### 8.11 `desktop`
+
+A monitor of the phone's own: the daemon creates a headless output in the running Hyprland session with the pixel size of the phone's window and a scale that makes everything finger-sized, the phone watches it through `screen` (8.6) and touches it with real multitouch. Present if `hyprctl` answers and the compositor is Hyprland. Caps: `touch` (`/dev/uinput` can be opened for writing), `ime` (the compositor offers `zwp_input_method_manager_v2`; at sign-in only its registry is read, so whether the seat is free is only known at `desktop.open`, whose reply says), `nav` (the shell answers `qs -c ionix ipc call phone …`). The phone needs screen caps `h264` and `hires` for the picture to be worth it, but that is its own decision.
+
+| Type | Dir | Kind | Body |
+|---|---|---|---|
+| `desktop.open` | P→D | request | `width: int` · `height: int` (pixels, 320..4096, even) · `scale: float` (1.0..4.0) · `refresh: int?` (30 \| 60, default 60) → reply `output: str` · `width: int` · `height: int` · `scale: float` (what the compositor applied; Hyprland moves a scale to the nearest one that gives whole logical pixels) · `logicalWidth: int` · `logicalHeight: int` · `created: bool` (false: an existing desktop was resized) · `touch: bool` (false: this desktop has no touch device, because uinput could not be used or Hyprland would not map it, and `desktop.touch` is ignored) · `ime: bool` (false: no input method this time, because another one holds the seat or none could be bound; no `desktop.textInput` comes and `desktop.commit` is typed). A daemon without these two fields means `true`. Sent again while open it **resizes** in place: windows stay, the workspace stays. `busy` if another phone has the desktop. `unavailable` if the output could not be made. `plugin_unavailable` if the plugin was switched off after this connection negotiated it. |
+| `desktop.close` | P→D | request | `{}` → `{}`. Idempotent. |
+| `desktop.closed` | D→P | push | `reason: str` — `desktop` (closed from the desktop: `ionix-link desktop close`, the plugin switched off) \| `failed` (the output disappeared) \| `shutdown`. Not sent in answer to `desktop.close`. |
+| `desktop.touch` | P→D | push | `touches: [{ id: int, x: float, y: float }]` — **every finger that is down right now** (at most 10; `id` 0..9, stable while that finger stays down; `x`, `y` normalised 0..1 within the output, 0,0 = top left, clamped). `[]` lifts them all. Ignored without an open desktop of this phone, without cap `touch` or with reply `touch: false`, and for the moment after a compositor config reload until the device is mapped to the output again. A malformed set (a repeated `id`, more than 10) is ignored whole. |
+| `desktop.textInput` | D→P | push | Cap `ime`. `active: bool` · `purpose: str?` — `normal` \| `number` \| `phone` \| `email` \| `url` \| `password` \| `terminal` (when active). A text field on the phone's desktop gained or lost focus: the phone shows or hides its keyboard. |
+| `desktop.commit` | P→D | push | Cap `ime`. `text: str?` (≤ 64 KiB) · `deleteBefore: int?` (code points to delete before the cursor first, 0..1024). Applied through the input method while a text input is active, in pieces of at most 4000 bytes cut between code points, each its own commit (the text field sees several); otherwise `text` is typed like `input.text` and `deleteBefore` sent as that many `BackSpace` keys. |
+| `desktop.nav` | P→D | push | `action: str` — `back` \| `home` \| `overview`. With cap `nav` it is `qs -c ionix ipc call phone <action> <output>`. Without it, or when the shell answers `no phone layout on …` (its phone layout is off) or fails, `back` is an `Escape` key and the others do nothing. |
+
+Rules:
+
+- **One desktop.** At most one exists at a time and it belongs to one phone. Its output is named `IONIX-LINK-1`; everything on the desktop that treats it specially (the shell's phone layout, the daemon's own clean-up) recognises it by the `IONIX-LINK-` prefix and by nothing else.
+- **Where it is.** Positioned far from every real monitor (not adjacent to any, so the mouse cannot cross onto it), mode `<width>x<height>@<refresh>`. The daemon gives it a wallpaper (the focused monitor's, through `awww` if present).
+- **Phone-like windows.** While it exists, every tiled window on that monitor fills it: one at a time, no gaps, border or rounding there. How (a layout, workspace rules, reacting to `openwindow`) is the daemon's business; floating windows (dialogs, menus) stay floating and are kept inside the screen.
+- **What a touch opens, opens here.** The first window that opens within 6 s of a touch is moved to the phone's output if the compositor put it elsewhere. So is every window, for a minute, of a process that started within 3 s after a touch (an app that takes its time to appear). An app that is already running opens its new window from the old process, which lands wherever the seat's focus is by then, and that is the desk as soon as the mouse moves; so a tiled window is moved even when its process has windows on the desk. Never moved: a **floating** window (Hyprland floats dialogs and every other window with a parent, which belong with their parent; one that is not moved does not use up the touch either), a window on a special workspace, and anything while the session is **locked** (`hyprland_lock_notifier_v1`; a touch on the lock screen counts as no touch). A window that opens on the phone's output uses up the touch.
+- **Touch.** A uinput device named `Ionix Link Touch` (`INPUT_PROP_DIRECT`, 10 slots, `ABS_MT_POSITION_X/Y` over a fixed 0..32767 range; `IONIX_LINK_TOUCH_NAME` renames it, for tests) created at `open`, mapped to the output (`hl.device({ name = "ionix-link-touch", output = … })`) and destroyed at close. Hyprland sends an unmapped touchscreen's taps to the focused real monitor, so a device that does not show up in `hyprctl devices` or cannot be mapped is destroyed at once (reply `touch: false`), and so is one that cannot be mapped again after a config reload; while a reload's remapping is pending, fingers are lifted and touches dropped. Messages are state, not events: the daemon diffs each set against the last one (new id → down, missing → up, moved → motion) and writes one `SYN_REPORT` per message, so a dropped or coalesced message can never leave a finger stuck. The phone sends a message at once when the set of ids changes and coalesces pure motion to at most 120 per second. All fingers are lifted when the desktop closes or the connection ends.
+- **Picture.** The phone streams the output with `screen.start {output, scale: 4.0, maxFps: 60, format: "h264"}` and sends `screen.start` again after every `desktop.open` reply (the mode changed under the encoder). `screen.outputs` lists it with `virtual: true`, which the ordinary screen picker leaves out.
+- **Keyboard.** With cap `ime` the daemon is the seat's input method **only while a desktop is open**, and never binds one to probe (so it never stands in the way of the user's own one). If another already holds the seat at `open`, the reply says `ime: false` and the phone's text is typed. If the compositor drops the input method's connection, the daemon binds it again (after 1, 2, 5, 10, then every 30 s), typing meanwhile, and gives up once another input method holds the seat. It sends `textInput` only for a text input whose window is on the phone's output. `input.key` (8.5) is still how keys that are not text go (`Return`, arrows, shortcuts).
+- **Leaving.** `desktop.close`, or the connection ending and not coming back **ready** within 30 s (a reconnect inside that window finds its desktop as it was and gets `created: false`), or the daemon stopping: fingers lifted, the stream on that output stopped (`screen.stopped {reason: "stopped"}`), every window on it moved to the focused real monitor's active workspace, the output removed. A grace that runs out while an `open` (or other change) is under way waits for it, and then leaves alone a desktop its phone took back meanwhile. A daemon that starts and finds an `IONIX-LINK-*` output it does not own does the same to it, one change at a time with everything else, so a phone that connects at once keeps the output it was given.
+- **Shared seat.** The desktop is part of the user's session: a touch takes keyboard focus like a click on any monitor would. That is by design, and why this is one user's second screen and not a second user's computer.
+
 ## 9. Control socket (CLI ↔ daemon)
 
 `$XDG_RUNTIME_DIR/ionix-link.sock` (`IONIX_LINK_SOCKET` overrides), `AF_UNIX` stream, mode 0600, removed on daemon exit. **Line-delimited JSON**: UTF-8, one object per line, `\n`-terminated, no newline inside an object. Requests on one connection are answered in order. The daemon takes requests from its own user only (`SO_PEERCRED` uid check).
@@ -511,6 +538,8 @@ Response: `{ "ok": true, "result": obj }` or `{ "ok": false, "code": str, "error
 | `commands` | — | `commands: [{id, title, icon, confirm, group, source: "builtin" \| "user", exec: [str]}]` |
 | `reload` | — | `{}`. Re-reads config and commands, pushes `commands.changed`. |
 | `subscribe` | — | `{}`, then a line `{"event": "state", "state": <state.json object>}` on every change until the client closes. For the desktop shell. |
+| `desktop` | — | `desktop:` state.json's `desktop` (section 10) |
+| `desktop.close` | — | `closed: bool` (false: none was open). The owner gets `desktop.closed {reason: "desktop"}` (8.11). |
 
 Error `code`s: `bad_request`, `unknown_cmd`, `no_device`, `ambiguous_device`, `not_connected`, `plugin_unavailable`, `no_pending`, `timeout`, `failed`.
 
@@ -534,8 +563,9 @@ Error `code`s: `bad_request`, `unknown_cmd`, `no_device`, `ambiguous_device`, `n
   "pid": 1234,
   "updated": 1763150000000,
   "hostId": "…", "hostName": "myeonix", "port": 47110, "fingerprint": "…",
-  "plugins": ["notifications", "media", "commands", "clipboard", "input", "screen", "status", "theme", "share"],
+  "plugins": ["notifications", "media", "commands", "clipboard", "input", "screen", "status", "theme", "share", "desktop"],
   "pairing": null,
+  "desktop": null,
   "devices": [
     { "id": "…", "name": "Pixel 8", "model": "Google Pixel 8", "paired": 1763000000000, "lastSeen": 1763150000000,
       "connected": true, "address": "192.168.1.31", "battery": { "level": 81, "charging": false },
@@ -543,5 +573,7 @@ Error `code`s: `bad_request`, `unknown_cmd`, `no_device`, `ambiguous_device`, `n
   ]
 }
 ```
+
+`desktop` is `null`, or the phone desktop (8.11): `{ "device": str (owner's id), "output": "IONIX-LINK-1", "width": int, "height": int, "scale": float, "logicalWidth": int, "logicalHeight": int, "connected": bool, "touch": bool, "ime": bool, "graceEnds": int? }`; `graceEnds` (ms) only while the owner is disconnected and the desktop waits for it.
 
 `Device` is one entry of `devices` (never the key). `pairing` is `null`, `{ "mode": "qr", "expires": int }`, or `{ "mode": "code", "expires": int, "name": str, "model": str, "code": str }`. `plugins` at the top is what the daemon has available; per device it is what was negotiated. A device that is receiving a shared file (§8.9) also has `transfers: [{ id, name, size, received }]`.

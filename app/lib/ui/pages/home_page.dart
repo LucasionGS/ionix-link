@@ -286,7 +286,7 @@ class _Tiles extends StatelessWidget {
     return ValueListenableBuilder<List<PluginInfo>>(
       valueListenable: source.plugins,
       builder: (context, plugins, _) {
-        final specs = [for (final spec in PluginPages.all) if (plugins.any((p) => p.name == spec.plugin)) spec];
+        final specs = [for (final spec in PluginPages.all) if (spec.isOffered(plugins)) spec];
         return ValueListenableBuilder<LinkStatus>(
           valueListenable: source.status,
           builder: (context, status, _) {

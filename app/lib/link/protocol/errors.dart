@@ -19,6 +19,7 @@ enum LinkErrorCode {
   invalidArgument("invalid_argument"),
   notFound("not_found"),
   busy("busy"),
+  unavailable("unavailable"),
   timeout("timeout"),
   failed("failed"),
   internal("internal"),
