@@ -234,6 +234,29 @@ void main() {
     expect((await debug("debug.stats"))["acks"], [1, 2, 3]);
   }, skip: skip);
 
+  test("screen video: access units arrive whole and in order, acks are coalesced", () async {
+    expect(Link.screen.canVideo, isTrue);
+    final units = <ScreenVideoUnit>[];
+    final subscription = Link.screen.video.listen((unit) {
+      units.add(unit);
+      Link.screen.ack(unit.seq);
+    });
+    final stream = await Link.screen.start("HEADLESS-1", scale: 0.5, format: ScreenClient.formatH264);
+    expect([stream.format, stream.width, stream.height], ["h264", 160, 96]);
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await subscription.cancel();
+    final stats = await debug("debug.stats");
+    await Link.screen.stop();
+    expect(units.map((unit) => unit.seq), List.generate(10, (i) => i + 1));
+    expect(units.where((unit) => unit.keyframe).map((unit) => unit.seq), [1, 6]);
+    expect(units.every((unit) => H264.isKeyframe(unit.bytes) == unit.keyframe), isTrue);
+    expect(H264.parameterSets(units.first.bytes), isNotNull);
+    expect(units.map((unit) => H264.nalUnits(unit.bytes).where((nal) => nal.type == H264.typeSlice || nal.type == H264.typeIdr).length).toSet(), {1});
+    expect((stats["videoStart"] as Map)["format"], "h264");
+    // Ten frames inside a few ms: the first ack goes at once, the newest one 100 ms later, nothing in between.
+    expect(stats["videoAcks"], [1, 10]);
+  }, skip: skip);
+
   test("the desktop's theme and wallpaper arrive, change, and persist", () async {
     final hostId = info["hostId"] as String;
     await waitFor(Link.theme.theme, (theme) => theme.name == "fakeix", what: "theme.changed");

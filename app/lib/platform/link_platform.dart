@@ -128,6 +128,15 @@ abstract class LinkPlatform {
 
   /// Delete every staged copy.
   Future<void> clearStagedFiles();
+
+  // Video
+
+  /// Whether the phone has an H.264 decoder that can draw into a Flutter texture.
+  Future<bool> canDecodeH264();
+
+  /// A new H.264 decoder with its own texture. [dispose] it when done.
+  /// @throws UnsupportedError where [canDecodeH264] is false.
+  Future<VideoDecoder> createH264Decoder();
 }
 
 /// Text or files another app handed to Ionix Link to send to the desktop.
@@ -173,6 +182,58 @@ class StagedFile {
 
   /// Hex SHA-256 when the platform computed it while copying, else null.
   final String? sha256;
+}
+
+/// An H.264 decoder drawing into a Flutter texture (`Texture(textureId: ...)`). Feed it access units in order,
+/// starting at a keyframe after each [configure].
+abstract class VideoDecoder {
+  /// The texture the decoded pictures appear in.
+  int get textureId;
+
+  /// The size of the decoded pictures and how they sit in the texture, once the decoder knows; null before.
+  ValueListenable<VideoPicture?> get picture;
+
+  /// The seq of every frame drawn into the texture, in order.
+  Stream<int> get decoded;
+
+  /// Decoder failures, as readable sentences. The decoder is unusable after one.
+  Stream<String> get errors;
+
+  /// (Re)start the decoder for pictures of [width]×[height] with the stream's SPS and PPS (each with a start code).
+  Future<void> configure({required int width, required int height, required Uint8List sps, required Uint8List pps});
+
+  /// Queue one access unit. [seq] comes back on [decoded] once it is drawn.
+  void decode(int seq, Uint8List accessUnit, {required bool keyframe});
+
+  /// Stop decoding and free the decoder and its texture.
+  Future<void> dispose();
+}
+
+/// Where the visible picture is in a [VideoDecoder]'s texture: decoders work in 16-px macroblocks, so a 640×360
+/// stream is decoded as 640×368 with an 8-px crop, and whether the texture already leaves that out depends on the
+/// renderer.
+class VideoPicture {
+  const VideoPicture({
+    required this.width,
+    required this.height,
+    required this.textureWidth,
+    required this.textureHeight,
+    required this.cropLeft,
+    required this.cropTop,
+  });
+
+  /// The visible picture, in px.
+  final int width;
+  final int height;
+
+  /// The texture's own size and the picture's offset in it; equal to [width]×[height] at 0,0 when nothing is cropped.
+  final int textureWidth;
+  final int textureHeight;
+  final int cropLeft;
+  final int cropTop;
+
+  /// Whether the texture holds more than the picture.
+  bool get cropped => textureWidth != width || textureHeight != height;
 }
 
 /// The phone's name and model as the platform reports them.

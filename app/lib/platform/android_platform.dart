@@ -9,6 +9,7 @@ import "package:flutter_local_notifications/flutter_local_notifications.dart";
 import "package:flutter_ringtone_player/flutter_ringtone_player.dart";
 
 import "../link/link.dart";
+import "android_video_decoder.dart";
 import "link_platform.dart";
 
 /// Entry point of the foreground service's isolate. The service only exists to keep the process (and so the
@@ -327,4 +328,10 @@ class AndroidPlatform extends LinkPlatform {
       debugPrint("ionix-link: could not clear shared files: ${error.message}");
     }
   }
+
+  @override
+  Future<bool> canDecodeH264() => AndroidVideoDecoder.available();
+
+  @override
+  Future<VideoDecoder> createH264Decoder() => AndroidVideoDecoder.create();
 }

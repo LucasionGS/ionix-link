@@ -50,7 +50,7 @@ FP = FP_RAW.hex()
 HOST_ID = secrets.token_hex(16)
 HOST_NAME = "fakeix"
 DAEMON_CAPS = {"notifications": ["dismiss", "phone"], "media": ["players", "volume", "art"], "commands": [], "clipboard": [],
-               "input": ["pointer", "keyboard"], "screen": ["jpeg"], "status": ["volume"], "theme": ["wallpaper"],
+               "input": ["pointer", "keyboard"], "screen": ["jpeg", "h264"], "status": ["volume"], "theme": ["wallpaper"],
                "share": ["text", "files"]}
 WALLPAPER = bytes.fromhex("ffd8ffe0") + b"fake wallpaper" * 8000 + bytes.fromhex("ffd9")  # > 64 KiB on purpose
 devices = {}  # deviceId -> key bytes
@@ -61,6 +61,17 @@ stats = {"moves": 0, "dx": 0.0, "dy": 0.0, "scrolls": 0, "buttons": [], "acks": 
 uploads = {}  # share transfer id -> {name, size, got, hash}
 theme = {"accent": "#9b59b6"}
 live = {}  # deviceId -> Conn
+
+
+def video_units():
+  """The access units of video.h264 (160x96, 10 frames, keyframes 1 and 6), cut at its access unit delimiters."""
+  with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "video.h264"), "rb") as f:
+    raw = f.read()
+  aud = b"\x00\x00\x00\x01\x09"
+  return [aud + part for part in raw.split(aud)[1:]]
+
+
+VIDEO = video_units()
 
 
 def theme_obj():
@@ -242,6 +253,8 @@ class Conn:
       stats["buttons"].append([body["button"], body["action"], stats["moves"]])
     elif typ == "status.battery":
       stats["battery"] = body
+    elif typ == "screen.ack" and getattr(self, "format", "jpeg") == "h264":
+      stats.setdefault("videoAcks", []).append(body["seq"])
     elif typ == "screen.ack":
       stats["acks"].append(body["seq"])
       if body["seq"] < 3: self.screen_frame()
@@ -293,8 +306,15 @@ class Conn:
     elif typ == "screen.outputs":
       reply({"outputs": [{"name": "HEADLESS-1", "description": "Fake", "x": 0, "y": 0, "width": 1920, "height": 1080,
                           "scale": 1.0, "focused": True}]})
+    elif typ == "screen.start" and body.get("format") == "h264":
+      self.seq, self.format = 0, "h264"
+      stats["videoStart"] = body
+      reply({"width": 160, "height": 96, "format": "h264"})
+      for i, unit in enumerate(VIDEO):
+        self.send("screen.video", {"output": "HEADLESS-1", "w": 160, "h": 96, "seq": i + 1, "keyframe": i % 5 == 0,
+                                   "pts": i * 100, "format": "h264", "time": int(time.time() * 1000)}, data=unit)
     elif typ == "screen.start":
-      self.seq = 0
+      self.seq, self.format = 0, "jpeg"
       reply({"width": 960, "height": 540})
       self.screen_frame()
     elif typ == "screen.stop":

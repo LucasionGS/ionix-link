@@ -26,12 +26,14 @@ app/                           Flutter app (android + linux), package ionix_link
     connection/                link_connection.dart (one socket), link_session.dart (reconnect + attach),
                                link_status.dart, discovery.dart (UDP), pairing.dart (QR and code flows)
     store/link_store.dart      link.json + flutter_secure_storage keys
-    plugins/                   plugin_client.dart (base) + one <name>_client.dart per plugin, models inside
+    plugins/                   plugin_client.dart (base) + one <name>_client.dart per plugin, models inside;
                                (share_client.dart: text, and chunked file uploads with progress/cancel)
+                               h264.dart (Annex-B helpers for the screen view's video)
   lib/platform/                Layer 3: OS glue behind `LinkPlatform`
     link_platform.dart         Interface + PlatformDevice
     android_platform.dart      The real one
     fallback_platform.dart     No-op for the Linux build
+    android_video_decoder.dart VideoDecoder over the video channels of android/.../VideoDecoders.kt (MediaCodec)
     platform_glue.dart         Subscribes Link streams to the platform (notifications, ring, battery, clipboard)
   android/.../kotlin/…/ionix_link/  Native Android: MainActivity, PhoneNotifications (channels, prefs), LinkNotificationListener
   lib/ui/                      Layer 2: widgets only
@@ -48,6 +50,7 @@ app/                           Flutter app (android + linux), package ionix_link
                                ion_card and the other shared pieces of the glass look, touchpad
   assets/fonts/                JetBrains Mono Nerd Font (OFL), the shell's font
   test/protocol_vectors_test.dart   PROTOCOL.md test vectors and codec cases
+  test/h264_test.dart          Annex-B splitting and parameter sets
   test/link_e2e_test.dart      Against a daemon; skipped unless IONIX_LINK_E2E_DIR is set
 ```
 
@@ -164,7 +167,7 @@ inside `<application>`:
 
 ## Packaging and the ISO (later)
 
-`PKGBUILD` (working tree, for the ISO) and `packaging/aur/PKGBUILD` (`ionix-link-git`), installing `bin/ionix-link` → `/usr/bin`, `systemd/ionix-link.service` → `/usr/lib/systemd/user/`. Depends: `python`, `openssl`, `systemd`. Optdepends: `qrencode`, `playerctl`, `wireplumber`, `libpulse` (pactl), `wl-clipboard`, `wtype`, `grim`, `libnotify`, `hyprland`, `wlr-randr`. In ionix-iso: `LOCAL_PACKAGES` in `aur/build-aur.sh`, a `packages.x86_64` line, and enabling the unit through a skel `graphical-session.target.wants` link for new accounts only; accounts that existed before enable it themselves.
+`PKGBUILD` (working tree, for the ISO) and `packaging/aur/PKGBUILD` (`ionix-link-git`), installing `bin/ionix-link` → `/usr/bin`, `systemd/ionix-link.service` → `/usr/lib/systemd/user/`. Depends: `python`, `openssl`, `systemd`. Optdepends: `qrencode`, `playerctl`, `wireplumber`, `libpulse` (pactl), `wl-clipboard`, `wtype`, `grim`, `wf-recorder`, `libnotify`, `hyprland`, `wlr-randr`. In ionix-iso: `LOCAL_PACKAGES` in `aur/build-aur.sh`, a `packages.x86_64` line, and enabling the unit through a skel `graphical-session.target.wants` link for new accounts only; accounts that existed before enable it themselves.
 
 ## Work split
 

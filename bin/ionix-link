@@ -38,6 +38,7 @@ own lock so a screen frame and a reply never interleave.
 """
 
 import asyncio
+import collections
 import copy
 import errno
 import glob
@@ -111,6 +112,14 @@ COMMAND_TIMEOUT = 10               # s a command may run before the reply says d
 COMMAND_TIMEOUT_MAX = 25           # s, so the reply still beats the phone's 30 s commands.run timeout
 COMMAND_OUTPUT_TAIL = 4096         # bytes of output returned with showOutput
 SCREEN_STALL = 30                  # s without screen.ack → screen.stopped "stalled"
+SCREEN_VIDEO_LAG = 0.3             # s of frames (at maxFps, at least 6) sent but not acked before video drops frames
+SCREEN_VIDEO_FLUSH = 0.003         # s of silence from the encoder that ends the access unit it is writing
+SCREEN_VIDEO_FIRST = 5             # s an encoder may take to write its first access unit
+SCREEN_VIDEO_BPP = 0.002           # default bitrate: bits per pixel per frame for each point of `quality`
+H264_ENCODERS = ("h264_vaapi", "h264_nvenc", "libx264")   # tried in this order; one that fails is skipped
+H264_RETRY = 600                   # s a hardware encoder that wrote no frame is left out before it is tried again
+H264_DEMOTE_AFTER = 3              # runs in a row without a frame that demote a hardware encoder that once worked
+VAAPI_DEVICE = "/dev/dri/renderD128"
 THEME_POLL = 2                     # s between theme file checks
 ART_FETCH_MAX = 16 * 1024 * 1024   # bytes of cover art read from a file or URL before giving up
 ART_FETCH_TIMEOUT = 5              # s per socket operation of an http(s) cover download ...
@@ -3665,20 +3674,119 @@ class InputPlugin(Plugin):
         return wtype
 
 
-class _Stream:
-    """One screen stream: what was asked, and the frame in flight."""
+class AnnexB:
+    """Splits an H.264 Annex-B byte stream into access units (§8.6), one per frame, as it arrives.
 
-    def __init__(self, conn, output, scale, quality, max_fps, size):
+    A NAL unit is complete when the next start code arrives. An access unit is complete when a NAL unit that starts
+    the next one arrives (H.264 7.4.1.2.3: an AUD, SPS, PPS, SEI or types 14..18, or a slice with
+    `first_mb_in_slice` 0, after a slice), or when `flush()` is called because the encoder went quiet: it writes a
+    frame in one burst, so waiting for the next frame's first NAL unit would add a frame of latency.
+    Every unit comes out with 4-byte start codes; a keyframe that lacks its SPS and PPS gets the last ones seen.
+    """
+
+    START = b"\x00\x00\x01"
+    VCL = {1, 5}               # slices (non-IDR, IDR); 2..4 are data partitioning, not in any profile we decode
+    IDR = 5
+    SPS = 7
+    PPS = 8
+    BEGINS_AU = {6, 7, 8, 9, 14, 15, 16, 17, 18}
+    FILLER = 12
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._nals = []            # NAL units of the access unit being collected
+        self._has_vcl = False
+        self._sps = None
+        self._pps = None
+
+    def feed(self, data):
+        """Add bytes; returns the access units they completed, as [(bytes, keyframe)]."""
+        self._buf += data
+        units = []
+        first = self._buf.find(self.START)
+        if first < 0:
+            # No start code yet: keep at most the last 3 bytes, which may be the start of one.
+            del self._buf[:max(0, len(self._buf) - 3)]
+            return units
+        pos = first + 3
+        while True:
+            nxt = self._buf.find(self.START, pos)
+            if nxt < 0:
+                break
+            end = nxt
+            while end > pos and self._buf[end - 1] == 0:
+                end -= 1           # the zero of a 4-byte start code (and trailing_zero_8bits) belong to no NAL unit
+            self._nal(bytes(self._buf[pos:end]), units)
+            pos = nxt + 3
+        del self._buf[:pos - 3]
+        return units
+
+    def flush(self):
+        """The encoder is quiet: the bytes so far end a NAL unit and the access unit. Returns [(bytes, keyframe)]."""
+        units = []
+        if len(self._buf) > 3 and self._buf.startswith(self.START):
+            self._nal(bytes(self._buf[3:]).rstrip(b"\x00"), units)
+            self._buf.clear()
+        if self._has_vcl:
+            units.append(self._finish())
+        return units
+
+    @property
+    def pending(self):
+        """Whether a flush would complete an access unit."""
+        return self._has_vcl or len(self._buf) > 3
+
+    def _nal(self, nal, units):
+        if not nal:
+            return
+        kind = nal[0] & 0x1F
+        if kind == self.FILLER:
+            return
+        if self._has_vcl and (kind in self.BEGINS_AU or (kind in self.VCL and len(nal) > 1 and nal[1] & 0x80)):
+            units.append(self._finish())
+        if kind == self.SPS:
+            self._sps = nal
+        elif kind == self.PPS:
+            self._pps = nal
+        elif kind in self.VCL:
+            self._has_vcl = True
+        self._nals.append(nal)
+
+    def _finish(self):
+        nals, self._nals, self._has_vcl = self._nals, [], False
+        kinds = {n[0] & 0x1F for n in nals}
+        key = self.IDR in kinds
+        if key and not {self.SPS, self.PPS} <= kinds and self._sps and self._pps:
+            nals = [self._sps, self._pps] + [n for n in nals if n[0] & 0x1F not in (self.SPS, self.PPS)]
+        return b"".join(b"\x00\x00\x00\x01" + n for n in nals), key
+
+
+class _Stream:
+    """One screen stream: what was asked, and the frames in flight."""
+
+    def __init__(self, conn, output, scale, quality, max_fps, size, fmt="jpeg", bitrate=None):
         self.conn = conn
         self.output = output
         self.scale = scale
         self.quality = quality
         self.max_fps = max_fps
         self.size = size           # (w, h) expected
+        self.format = fmt          # "jpeg" | "h264"
+        self.bitrate = bitrate     # bits/s, h264 only
         self.seq = 0
         self.acked = asyncio.Event()
         self.acked.set()
         self.task = None
+        # Video (h264) flow control: frames are sent without waiting, up to `max_lag` unacknowledged.
+        self.acked_seq = 0
+        self.ack_at = time.monotonic()
+        self.max_lag = max(6, round(max_fps * SCREEN_VIDEO_LAG))
+        self.need_key = False      # a frame was dropped: nothing but a keyframe can be decoded next
+        self.dropped = 0
+        self.queue = collections.deque()
+        self.queued = asyncio.Event()
+        self.started = time.monotonic()
+        self.stall = False
 
 
 class ScreenPlugin(Plugin):
@@ -3686,7 +3794,12 @@ class ScreenPlugin(Plugin):
     One stream per connection: capture `grim -o <output> -s <scale> -t jpeg -q <quality> -c -`, send as a
     binary `screen.frame`, wait for `screen.ack` of that seq and 1/maxFps, repeat. Capture starts when the ack
     is in and the interval is nearly over, so a slow link lowers the frame rate rather than showing old frames.
-    SCREEN_STALL s without an ack → screen.stopped "stalled"."""
+    SCREEN_STALL s without an ack → screen.stopped "stalled".
+
+    `format: "h264"` streams video instead: `wf-recorder` (wlr-screencopy, constant frame rate) encodes into a pipe,
+    `AnnexB` cuts it into one access unit per frame, and each goes out as a binary `screen.video` without waiting
+    for an ack; the phone acks now and then, and frames beyond `max_lag` unacknowledged ones are dropped up to the
+    next keyframe. The encoder runs in its own process group, killed with the stream."""
 
     name = "screen"
     tools = ("grim",)
@@ -3699,9 +3812,12 @@ class ScreenPlugin(Plugin):
         self._locks = {}           # conn → Lock around screen.start / screen.stop
         self._outputs = None
         self._outputs_at = 0.0
+        self._skipped = {}         # hardware encoder → monotonic time it is tried again (it wrote no frame)
+        self._worked = set()       # encoders that have written a frame since the daemon started
+        self._empty_runs = {}      # encoder → runs in a row that wrote no frame
 
     def caps(self):
-        return ["jpeg"]
+        return ["jpeg", "h264"] if tool("wf-recorder") and self._encoders() else ["jpeg"]
 
     async def outputs(self, fresh=False):
         """[{name, description, x, y, width, height, scale, focused}] in logical px."""
@@ -3767,7 +3883,13 @@ class ScreenPlugin(Plugin):
                 return await self._start(conn, b)
         if t == "screen.ack":
             stream = self.streams.get(conn)
-            if stream is not None and b.get("seq") == stream.seq:
+            seq = b.get("seq")
+            if stream is None or not is_int(seq):
+                return None
+            if stream.format == "h264":
+                if stream.acked_seq < seq <= stream.seq:
+                    stream.acked_seq, stream.ack_at = seq, time.monotonic()
+            elif seq == stream.seq:
                 stream.acked.set()
             return None
         if t == "screen.stop":
@@ -3790,15 +3912,37 @@ class ScreenPlugin(Plugin):
             raise LinkError(ERR_INVALID_ARGUMENT, "\"quality\" must be an integer from 1 to 100.")
         if not is_int(max_fps) or not 1 <= max_fps <= 30:
             raise LinkError(ERR_INVALID_ARGUMENT, "\"maxFps\" must be an integer from 1 to 30.")
+        fmt, bitrate = b.get("format", "jpeg"), b.get("bitrate")
+        if fmt not in ("jpeg", "h264"):
+            raise LinkError(ERR_INVALID_ARGUMENT, "\"format\" must be \"jpeg\" or \"h264\".")
+        if fmt == "h264" and "h264" not in self.caps():
+            raise LinkError(ERR_INVALID_ARGUMENT, "This desktop cannot encode video (wf-recorder or an encoder is missing); "
+                                                  "ask for \"jpeg\" instead.")
+        if bitrate is not None and (not is_int(bitrate) or not 100_000 <= bitrate <= 50_000_000):
+            raise LinkError(ERR_INVALID_ARGUMENT, "\"bitrate\" must be an integer from 100000 to 50000000 (bits/s).")
         await self._stop_stream(conn)
         if conn.state == "closed":
             raise LinkError(CERR_NOT_CONNECTED, "The phone disconnected.")
-        size = (max(1, round(out["width"] * scale)), max(1, round(out["height"] * scale)))
-        stream = _Stream(conn, name, float(scale), quality, max_fps, size)
+        size = self._frame_size(out, scale, fmt)
+        if fmt == "h264" and bitrate is None:
+            bitrate = self._default_bitrate(size, max_fps, quality)
+        stream = _Stream(conn, name, float(scale), quality, max_fps, size, fmt, bitrate)
         self.streams[conn] = stream
-        stream.task = conn.spawn(self._run(stream))
-        log(f"{conn.label()}: streaming {name} at {size[0]}x{size[1]}, up to {max_fps} fps.", debug=True)
-        return {"width": size[0], "height": size[1]}
+        stream.task = conn.spawn(self._run_video(stream) if fmt == "h264" else self._run(stream))
+        log(f"{conn.label()}: streaming {name} as {fmt} at {size[0]}x{size[1]}, up to {max_fps} fps.", debug=True)
+        return {"width": size[0], "height": size[1], "format": fmt}
+
+    @staticmethod
+    def _frame_size(out, scale, fmt):
+        w, h = max(1, round(out["width"] * scale)), max(1, round(out["height"] * scale))
+        if fmt == "h264":
+            # 4:2:0 chroma needs even sides.
+            w, h = max(2, w - w % 2), max(2, h - h % 2)
+        return w, h
+
+    @staticmethod
+    def _default_bitrate(size, fps, quality):
+        return int(min(50_000_000, max(100_000, size[0] * size[1] * fps * quality * SCREEN_VIDEO_BPP)))
 
     async def on_close(self, conn):
         async with self._lock_for(conn):
@@ -3865,6 +4009,181 @@ class ScreenPlugin(Plugin):
             if not await s.conn.send("screen.frame", body, data=jpeg):
                 return
             last_sent = time.monotonic()
+
+    def _encoders(self):
+        """H.264 encoders to try, best first: $IONIX_LINK_H264_ENCODER alone if set, else the hardware ones whose
+        device exists, then libx264, minus a hardware one that wrote no frame lately. libx264 is never left out: a
+        failure that is not the encoder's (the screen off, a mode change, a locked session) must not end video."""
+        pinned = os.environ.get("IONIX_LINK_H264_ENCODER", "")
+        if pinned:
+            return [pinned]
+        devices = {"h264_vaapi": VAAPI_DEVICE, "h264_nvenc": "/dev/nvidiactl"}
+        now = time.monotonic()
+        for e in [e for e, until in self._skipped.items() if until <= now]:
+            del self._skipped[e]
+        return [e for e in H264_ENCODERS if e not in self._skipped and os.path.exists(devices.get(e, "/"))]
+
+    def _note_encoder(self, encoder, count):
+        """Remember how a run of `encoder` went. A hardware encoder that has never written a frame since the daemon
+        started (it cannot work here), or one that has stopped writing any H264_DEMOTE_AFTER runs in a row, is left
+        out for H264_RETRY s; one that worked before and failed once is a transient failure and stays."""
+        if count > 0:
+            self._worked.add(encoder)
+            self._empty_runs.pop(encoder, None)
+            return
+        runs = self._empty_runs[encoder] = self._empty_runs.get(encoder, 0) + 1
+        if encoder != "libx264" and (encoder not in self._worked or runs >= H264_DEMOTE_AFTER):
+            self._skipped[encoder] = time.monotonic() + H264_RETRY
+            self._empty_runs.pop(encoder, None)
+
+    @staticmethod
+    def _encoder_argv(encoder, s):
+        """wf-recorder writing raw Annex-B H.264 to stdout: constant frame rate (-D -r, so a keyframe comes every
+        second even on a still screen), no B-frames, GOP of one second, capped bitrate, scaled to the stream size."""
+        (w, h), fps, rate = s.size, s.max_fps, s.bitrate
+        argv = [tool("wf-recorder") or "wf-recorder", "-y", "-o", s.output, "-c", encoder, "-m", "h264",
+                "-f", "/dev/stdout", "-D", "-r", str(fps), "-b", "0", "-p", f"g={fps}", "-p", f"b={rate}",
+                "-p", f"maxrate={rate}", "-p", f"bufsize={max(rate // 2, 50_000)}"]
+        # Hardware encoders keep frames in flight by default (nvenc: 3 or more), which is latency the phone would see.
+        if encoder == "h264_vaapi":
+            return argv + ["-d", VAAPI_DEVICE, "-F", f"scale_vaapi=w={w}:h={h}:format=nv12", "-p", "async_depth=1"]
+        argv += ["-x", "yuv420p", "-F", f"scale={w}:{h}"]
+        if encoder == "libx264":
+            argv += ["-p", "preset=ultrafast", "-p", "tune=zerolatency"]
+        elif encoder == "h264_nvenc":
+            argv += ["-p", "preset=p1", "-p", "tune=ull", "-p", "zerolatency=1", "-p", "delay=0"]
+        return argv
+
+    async def _run_video(self, s):
+        """Run encoders for stream `s` until it stops: restart one that exits (3 quick failures → capture_failed),
+        and move on to the next encoder when one never writes a frame."""
+        sender = asyncio.create_task(self._send_video(s))
+        failures = 0
+        try:
+            while True:
+                encoders = self._encoders()
+                if not encoders:
+                    await self._stopped(s, "capture_failed")
+                    return
+                encoder, started = encoders[0], time.monotonic()
+                count = await self._encode(s, encoder)
+                self._note_encoder(encoder, count)
+                if s.stall:
+                    await self._stopped(s, "stalled")
+                    return
+                out = next((o for o in await self.outputs(fresh=True) if o["name"] == s.output), None)
+                if out is None:
+                    await self._stopped(s, "output_gone")
+                    return
+                if count == 0 and encoder in self._skipped and self._encoders():
+                    log(f"{encoder} could not encode {s.output}; trying {self._encoders()[0]}.", debug=True)
+                    continue
+                failures = 0 if time.monotonic() - started > 10 else failures + 1
+                if failures >= 3:
+                    await self._stopped(s, "capture_failed")
+                    return
+                await asyncio.sleep(0.5)
+                # The output may have changed mode or turned; the next encoder starts on a keyframe.
+                s.size = self._frame_size(out, s.scale, "h264")
+                s.need_key = True
+        finally:
+            sender.cancel()
+            try:
+                await sender
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _encode(self, s, encoder):
+        """One encoder process: cut its output into access units and offer each to the stream. Returns how many it
+        wrote; sets `s.stall` when the phone has not acked for SCREEN_STALL s."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._encoder_argv(encoder, s), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, start_new_session=True)
+        except OSError as e:
+            log(f"Could not start wf-recorder: {e.strerror or e}.")
+            return 0
+        tail = collections.deque(maxlen=6)
+        errors = asyncio.create_task(self._drain_lines(proc.stderr, tail))
+        split, count, eof = AnnexB(), 0, False
+        try:
+            while not eof:
+                if s.seq > s.acked_seq and time.monotonic() - s.ack_at > SCREEN_STALL:
+                    s.stall = True
+                    return count
+                try:
+                    data = await asyncio.wait_for(proc.stdout.read(1 << 20),
+                                                  SCREEN_VIDEO_FLUSH if split.pending else SCREEN_VIDEO_FIRST)
+                except TimeoutError:
+                    if not split.pending:
+                        log(f"{encoder} wrote nothing for {SCREEN_VIDEO_FIRST} s.", debug=True)
+                        return count
+                    units = split.flush()
+                else:
+                    eof = not data
+                    units = split.flush() if eof else split.feed(data)
+                for unit, key in units:
+                    count += 1
+                    self._offer(s, unit, key)
+            log(f"{encoder} exited on {s.output} (status {await proc.wait()}): {' | '.join(tail)[-300:]}", debug=True)
+            return count
+        finally:
+            errors.cancel()
+            await self._kill_group(proc)
+
+    def _offer(self, s, unit, key):
+        """Queue an access unit for sending, or drop it: §8.6 video flow control."""
+        if len(unit) > MAX_FRAME - 4096 or s.seq - s.acked_seq >= s.max_lag or (s.need_key and not key):
+            if not s.need_key:
+                log(f"{s.conn.label()}: video is {s.seq - s.acked_seq} frames behind; dropping to the next keyframe.",
+                    debug=True)
+            s.need_key = True
+            s.dropped += 1
+            return
+        s.need_key = False
+        s.seq += 1
+        body = {"output": s.output, "w": s.size[0], "h": s.size[1], "seq": s.seq, "format": "h264", "keyframe": key,
+                "pts": round((time.monotonic() - s.started) * 1000), "time": now_ms()}
+        s.queue.append((body, unit))
+        s.queued.set()
+
+    @staticmethod
+    async def _send_video(s):
+        while True:
+            await s.queued.wait()
+            while s.queue:
+                body, unit = s.queue.popleft()
+                if not await s.conn.send("screen.video", body, data=unit):
+                    return
+            s.queued.clear()
+
+    @staticmethod
+    async def _drain_lines(reader, tail):
+        """Keep the last lines of an encoder's stderr for the log, so its pipe never fills."""
+        while True:
+            try:
+                line = await reader.readline()
+            except ValueError:
+                continue
+            if not line:
+                return
+            tail.append(line.decode("utf-8", "replace").strip())
+
+    @staticmethod
+    async def _kill_group(proc):
+        """SIGTERM the encoder's process group, SIGKILL it if the encoder is still there after 1 s."""
+        if proc.returncode is not None:
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), 1)
+                return
+            except TimeoutError:
+                continue
 
 
 class StatusPlugin(Plugin):

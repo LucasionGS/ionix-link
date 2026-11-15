@@ -342,10 +342,16 @@ class ScreenAwake {
 /// The screen plugin.
 abstract class ScreenSource {
   Future<List<ScreenOutput>> outputs();
-  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15});
+  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15, String format = ScreenClient.formatJpeg});
   Future<void> stop();
   void ack(int seq);
   Stream<ScreenFrame> get frames;
+
+  /// Whether the desktop can stream H.264 video.
+  bool get canVideo;
+
+  /// Video access units, for a stream started with [ScreenClient.formatH264].
+  Stream<ScreenVideoUnit> get video;
   ValueListenable<ScreenStreamInfo?> get stream;
   Stream<String> get stopped;
 }
@@ -356,8 +362,8 @@ class LinkScreenSource extends ScreenSource {
   Future<List<ScreenOutput>> outputs() => Link.screen.outputs();
 
   @override
-  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15}) {
-    return Link.screen.start(output, scale: scale, quality: quality, maxFps: maxFps);
+  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15, String format = ScreenClient.formatJpeg}) {
+    return Link.screen.start(output, scale: scale, quality: quality, maxFps: maxFps, format: format);
   }
 
   @override
@@ -368,6 +374,12 @@ class LinkScreenSource extends ScreenSource {
 
   @override
   Stream<ScreenFrame> get frames => Link.screen.frames;
+
+  @override
+  bool get canVideo => Link.screen.canVideo;
+
+  @override
+  Stream<ScreenVideoUnit> get video => Link.screen.video;
 
   @override
   ValueListenable<ScreenStreamInfo?> get stream => Link.screen.stream;

@@ -4,6 +4,7 @@ import "package:flutter/services.dart";
 import "package:material_ui/material_ui.dart";
 
 import "../../link/link.dart";
+import "../../platform/link_platform.dart";
 import "../sources.dart";
 import "../theme.dart";
 import "../widgets/adaptive_scaffold.dart";
@@ -15,14 +16,18 @@ import "../widgets/keys_panel.dart";
 import "../widgets/touchpad.dart";
 import "../widgets/window_layout.dart";
 
-/// Screen viewer: output picker, then the desktop's frames painted with `Image.memory(gaplessPlayback: true)` and
-/// acknowledged once shown; a tap is a click at that spot, a drag moves the pointer there, a pinch zooms, and two
-/// fingers scroll (or pan when zoomed in). The stream stops when the page goes away. In tabletop posture the picture
-/// is on the upright half and a touchpad with keys on the flat one.
+/// Screen viewer: output picker, then the desktop's picture; a tap is a click at that spot, a drag moves the pointer
+/// there, a pinch zooms, and two fingers scroll (or pan when zoomed in). The stream stops when the page goes away. In
+/// tabletop posture the picture is on the upright half and a touchpad with keys on the flat one.
+///
+/// The picture is H.264 video when the desktop offers it and the phone has a decoder ([LinkPlatform.createH264Decoder]
+/// draws it into a texture), unless the options sheet asks for still frames; otherwise JPEG frames painted with
+/// `Image.memory(gaplessPlayback: true)`, acknowledged once shown. A decoder that fails switches the page to JPEG for
+/// the rest of the app's run, said once. Video stops while the app is in the background and starts again on return.
 ///
 /// Full screen ([ShellController.fullscreen]) hosts the same viewer, with the same stream, in the root overlay
 /// through an [OverlayPortal], so it covers the dock, the rail and both panes, spans a fold, and survives a fold or
-/// unfold with nothing restarting.
+/// unfold with nothing restarting (a texture is only an id, so the decoder carries on behind either place).
 class ScreenPage extends StatefulWidget {
   const ScreenPage({super.key});
 
@@ -38,7 +43,7 @@ class _Quality {
   final double scale;
 }
 
-class _ScreenPageState extends State<ScreenPage> {
+class _ScreenPageState extends State<ScreenPage> with WidgetsBindingObserver {
   static const List<_Quality> _qualities = [_Quality("Low", 40, 0.35), _Quality("Medium", 60, 0.5), _Quality("High", 80, 0.75)];
   static const List<int> _fpsChoices = [5, 10, 15, 30];
 
@@ -54,6 +59,24 @@ class _ScreenPageState extends State<ScreenPage> {
 
   ScreenFrame? _frame;
   int _ackedSeq = -1;
+
+  // Video. The choice and a failure last for the app's run, not the page's.
+  static bool _preferVideo = true;
+  static bool _videoBroken = false;
+  static const Duration _firstPictureTimeout = Duration(seconds: 4);
+  bool _phoneDecodes = false;
+  bool _captureFailed = false; // the desktop's encoder gave up on this page: still pictures until the user asks for video again
+  String _format = ScreenClient.formatJpeg; // of the running stream
+  VideoDecoder? _decoder;
+  H264ParameterSets? _decoderSets; // what the decoder was configured with; null = wait for a keyframe
+  Size? _videoSize;
+  bool _videoShown = false;
+  bool _suspended = false;
+  Timer? _firstPicture; // a decoder fed this long without drawing anything counts as failed
+  Future<void> _videoChain = Future.value();
+  StreamSubscription<ScreenVideoUnit>? _videoUnits;
+  StreamSubscription<int>? _videoDecoded;
+  StreamSubscription<String>? _videoErrors;
   int _framesThisSecond = 0;
   int _shownFps = 0;
   Timer? _fpsTimer;
@@ -136,14 +159,30 @@ class _ScreenPageState extends State<ScreenPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     ScreenAwake.hold();
+    _videoUnits = _screen.video.listen(_onVideoUnit);
     _frames = _screen.frames.listen((frame) {
       _framesThisSecond++;
       if (mounted) setState(() => _frame = frame);
     });
     _stopped = _screen.stopped.listen((reason) {
-      if (!mounted) return;
-      setState(() => _frame = null);
+      if (!mounted || _suspended) return;
+      final output = _output;
+      final wasVideo = _format == ScreenClient.formatH264;
+      setState(() {
+        _frame = null;
+        _videoShown = false;
+      });
+      if (reason == "capture_failed" && wasVideo && output != null && !_captureFailed) {
+        // The encoder can fail for a while (the screen off, a mode change) while grim still works, so ask for stills.
+        _captureFailed = true;
+        showMessage(context, "The desktop couldn't encode video, so the screen is shown as still pictures.");
+        _releaseDecoder().whenComplete(() {
+          if (mounted) _start(output);
+        });
+        return;
+      }
       showMessage(context, switch (reason) {
         "output_gone" => "That screen was unplugged or turned off.",
         "stalled" => "The picture stopped coming through. Start it again.",
@@ -157,11 +196,36 @@ class _ScreenPageState extends State<ScreenPage> {
         _framesThisSecond = 0;
       });
     });
-    _loadOutputs();
+    _init();
+  }
+
+  Future<void> _init() async {
+    _phoneDecodes = await LinkPlatform.instance.canDecodeH264();
+    if (mounted) await _loadOutputs();
+  }
+
+  bool get _useVideo => _screen.canVideo && _phoneDecodes && _preferVideo && !_videoBroken && !_captureFailed;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // A decoder has nothing to draw on while the app is away, and a stream nobody sees only costs the desktop. JPEG
+    // keeps its old behaviour (frames simply stop being acked).
+    if ((state == AppLifecycleState.hidden || state == AppLifecycleState.paused) && _format == ScreenClient.formatH264 && !_suspended) {
+      _suspended = true;
+      _screen.stop().catchError((_) {});
+      _releaseDecoder();
+      setState(() => _videoShown = false);
+    }
+    else if (state == AppLifecycleState.resumed && _suspended) {
+      _suspended = false;
+      final output = _output;
+      if (output != null) _start(output);
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     ScreenAwake.release();
     _clusterTimer?.cancel();
     final shell = _shell?..removeListener(_onShell);
@@ -172,7 +236,9 @@ class _ScreenPageState extends State<ScreenPage> {
     _fpsTimer?.cancel();
     _frames?.cancel();
     _stopped?.cancel();
+    _videoUnits?.cancel();
     _screen.stop().catchError((_) {});
+    _releaseDecoder();
     super.dispose();
   }
 
@@ -194,22 +260,137 @@ class _ScreenPageState extends State<ScreenPage> {
   }
 
   Future<void> _start(String output) async {
+    var video = _useVideo;
+    _firstPicture?.cancel();
+    _firstPicture = null;
     setState(() {
       _output = output;
       _starting = true;
       _frame = null;
       _ackedSeq = -1;
+      _videoShown = false;
+      _videoSize = null;
+      _decoderSets = null; // a new stream starts the decoder afresh on its first keyframe
       _zoom = 1;
       _pan = Offset.zero;
     });
     try {
+      if (video) {
+        video = await _ensureDecoder();
+      }
+      else {
+        await _releaseDecoder();
+      }
       final q = _qualities[_quality];
-      await _screen.start(output, scale: q.scale, quality: q.quality, maxFps: _fps);
+      final info = await _screen.start(output, scale: q.scale, quality: q.quality, maxFps: _fps, format: video ? ScreenClient.formatH264 : ScreenClient.formatJpeg);
+      if (mounted) setState(() => _format = info.format);
     } on LinkException catch (e) {
       if (mounted) showMessage(context, e.message);
     } finally {
       if (mounted) setState(() => _starting = false);
     }
+  }
+
+  /// A decoder for the next video stream; false (and the switch to JPEG is announced) when the phone cannot make one.
+  Future<bool> _ensureDecoder() async {
+    if (_decoder != null) return true;
+    try {
+      final decoder = await LinkPlatform.instance.createH264Decoder();
+      if (!mounted) {
+        await decoder.dispose();
+        return false;
+      }
+      _decoder = decoder;
+      _videoDecoded = decoder.decoded.listen(_onVideoDecoded);
+      _videoErrors = decoder.errors.listen(_onVideoError);
+      decoder.picture.addListener(_onVideoPicture);
+      return true;
+    } on UnsupportedError catch (e) {
+      _videoFailed(e.message ?? "The phone cannot decode video.");
+      return false;
+    }
+  }
+
+  Future<void> _releaseDecoder() async {
+    _firstPicture?.cancel();
+    _firstPicture = null;
+    final decoder = _decoder;
+    if (decoder == null) return;
+    _decoder = null;
+    _decoderSets = null;
+    decoder.picture.removeListener(_onVideoPicture);
+    await _videoDecoded?.cancel();
+    await _videoErrors?.cancel();
+    await decoder.dispose();
+  }
+
+  void _onVideoUnit(ScreenVideoUnit unit) {
+    // In order, one at a time: a keyframe may (re)configure the decoder, and nothing may overtake that.
+    _videoChain = _videoChain.then((_) => _feed(unit)).catchError((Object error) => debugPrint("ionix-link: video: $error"));
+  }
+
+  Future<void> _feed(ScreenVideoUnit unit) async {
+    final decoder = _decoder;
+    if (decoder == null || !mounted || _format != ScreenClient.formatH264) return;
+    if (unit.keyframe) {
+      final sets = H264.parameterSets(unit.bytes);
+      final size = Size(unit.width.toDouble(), unit.height.toDouble());
+      if (sets != null && (!sets.sameAs(_decoderSets) || size != _videoSize)) {
+        // A new stream, or the same one at a new size (the output changed): start the decoder again.
+        _decoderSets = sets;
+        _videoSize = size;
+        await decoder.configure(width: unit.width, height: unit.height, sps: sets.sps, pps: sets.pps);
+      }
+    }
+    if (_decoderSets == null || !identical(decoder, _decoder)) return;
+    // Some decoders swallow a stream they cannot handle without reporting an error.
+    if (!_videoShown) _firstPicture ??= Timer(_firstPictureTimeout, () => _onVideoError("The phone's video decoder showed nothing."));
+    decoder.decode(unit.seq, unit.bytes, keyframe: unit.keyframe);
+  }
+
+  void _onVideoDecoded(int seq) {
+    _framesThisSecond++;
+    _firstPicture?.cancel();
+    _firstPicture = null;
+    _screen.ack(seq);
+    if (!_videoShown && mounted) setState(() => _videoShown = true);
+  }
+
+  void _onVideoPicture() {
+    final picture = _decoder?.picture.value;
+    if (picture == null || !mounted) return;
+    setState(() => _videoSize = Size(picture.width.toDouble(), picture.height.toDouble()));
+  }
+
+  void _onVideoError(String message) {
+    if (_decoder == null) return;
+    debugPrint("ionix-link: $message");
+    _videoFailed(message);
+    final output = _output;
+    _releaseDecoder().whenComplete(() {
+      if (mounted && output != null) _start(output);
+    });
+  }
+
+  void _videoFailed(String message) {
+    if (_videoBroken) return;
+    _videoBroken = true;
+    if (mounted) showMessage(context, "Video didn't work on this phone, so the screen is shown as still pictures.");
+  }
+
+  /// The picture's size in px, once there is one to show.
+  Size? get _pictureSize {
+    if (_format == ScreenClient.formatH264) return _videoShown ? _videoSize : null;
+    final frame = _frame;
+    return frame == null ? null : Size(frame.width.toDouble(), frame.height.toDouble());
+  }
+
+  /// "1280×720 · H.264 · 30 fps", with the zoom when zoomed in.
+  String get _stats {
+    final size = _pictureSize;
+    if (size == null) return "…";
+    final mode = _format == ScreenClient.formatH264 ? "H.264" : "JPEG";
+    return "${size.width.round()}×${size.height.round()} · $mode · $_shownFps fps${_zoom > 1.01 ? " · ${_zoom.toStringAsFixed(1)}×" : ""}";
   }
 
   void _ack(int seq) {
@@ -219,8 +400,8 @@ class _ScreenPageState extends State<ScreenPage> {
   }
 
   // The rectangle the picture occupies inside the viewer before zoom: the frame fitted to the viewer.
-  Rect _fitted(Size view, ScreenFrame frame) {
-    final aspect = frame.width / frame.height;
+  Rect _fitted(Size view, Size picture) {
+    final aspect = picture.width / picture.height;
     var w = view.width;
     var h = w / aspect;
     if (h > view.height) {
@@ -231,11 +412,11 @@ class _ScreenPageState extends State<ScreenPage> {
   }
 
   Offset? _toNormalised(Offset local) {
-    final frame = _frame;
-    if (frame == null || _viewSize.isEmpty) return null;
+    final picture = _pictureSize;
+    if (picture == null || _viewSize.isEmpty) return null;
     final center = _viewSize.center(Offset.zero);
     final unzoomed = center + (local - center - _pan) / _zoom;
-    final rect = _fitted(_viewSize, frame);
+    final rect = _fitted(_viewSize, picture);
     if (!rect.contains(unzoomed)) return null;
     return Offset((unzoomed.dx - rect.left) / rect.width, (unzoomed.dy - rect.top) / rect.height);
   }
@@ -308,6 +489,21 @@ class _ScreenPageState extends State<ScreenPage> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  if (_screen.canVideo && _phoneDecodes && !_videoBroken) ...[
+                    Text("Picture type", style: text.titleMedium),
+                    const SizedBox(height: IonixSpace.sm),
+                    SegmentedButton<bool>(
+                      segments: const [ButtonSegment(value: true, label: Text("Video")), ButtonSegment(value: false, label: Text("Still frames"))],
+                      selected: {_preferVideo && !_captureFailed},
+                      onSelectionChanged: (s) => setSheet(() {
+                        _preferVideo = s.first;
+                        if (s.first) _captureFailed = false;
+                      }),
+                    ),
+                    const SizedBox(height: IonixSpace.xs),
+                    Text("Video is smoother; still frames are sharper on a slow connection.", style: text.bodySmall),
+                    const SizedBox(height: IonixSpace.lg),
+                  ],
                   Text("Picture quality", style: text.titleMedium),
                   const SizedBox(height: IonixSpace.sm),
                   SegmentedButton<int>(
@@ -346,17 +542,42 @@ class _ScreenPageState extends State<ScreenPage> {
       return const EmptyState(icon: Icons.desktop_access_disabled_outlined, title: "No screens found", message: "Your desktop didn't report any display to show.");
     }
     return _Viewer(
-      frame: _frame,
+      pictureSize: _pictureSize,
+      picture: _picture(),
+      stats: _stats,
       starting: _starting,
-      fps: _shownFps,
       zoom: _zoom,
       pan: _pan,
       bare: bare,
       onSize: _setViewSize,
-      onAck: _ack,
       onScaleStart: _onScaleStart,
       onScaleUpdate: _onScaleUpdate,
       onTapUp: _onTapUp,
+    );
+  }
+
+  /// The current picture: the video texture, or the newest JPEG frame (acked once painted).
+  Widget? _picture() {
+    final decoder = _decoder;
+    if (_format == ScreenClient.formatH264) {
+      if (decoder == null || !_videoShown) return null;
+      return _VideoView(textureId: decoder.textureId, picture: decoder.picture.value, size: _videoSize);
+    }
+    final f = _frame;
+    if (f == null) return null;
+    return Image.memory(
+      f.bytes,
+      gaplessPlayback: true,
+      fit: BoxFit.contain,
+      filterQuality: FilterQuality.medium,
+      frameBuilder: (context, child, frameNumber, sync) {
+        if (frameNumber != null || sync) _ack(f.seq);
+        return child;
+      },
+      errorBuilder: (context, error, stack) {
+        _ack(f.seq);
+        return const SizedBox.shrink();
+      },
     );
   }
 
@@ -419,7 +640,6 @@ class _ScreenPageState extends State<ScreenPage> {
           final top = padding.top + 8;
           final right = layout.hasVerticalFold ? fold!.left - 8 : layout.size.width - padding.right - 12;
           final outputs = _outputs ?? const <ScreenOutput>[];
-          final frame = _frame;
           return Material(
             color: t.bgDeep,
             child: Stack(
@@ -477,7 +697,7 @@ class _ScreenPageState extends State<ScreenPage> {
                                   IconButton(tooltip: "Picture options", icon: Icon(Icons.tune_rounded, color: t.textBright), onPressed: _output == null ? null : _showOptions),
                                   Padding(
                                     padding: const EdgeInsets.symmetric(horizontal: IonixSpace.sm),
-                                    child: Text(frame == null ? "…" : "${frame.width}×${frame.height} · $_shownFps fps${_zoom > 1.01 ? " · ${_zoom.toStringAsFixed(1)}×" : ""}", style: Theme.of(context).textTheme.labelMedium?.copyWith(color: t.textBright)),
+                                    child: Text(_stats, style: Theme.of(context).textTheme.labelMedium?.copyWith(color: t.textBright)),
                                   ),
                                 ],
                               ),
@@ -550,29 +770,34 @@ class _ScreenPageState extends State<ScreenPage> {
 
 class _Viewer extends StatelessWidget {
   const _Viewer({
-    required this.frame,
+    required this.pictureSize,
+    required this.picture,
+    required this.stats,
     required this.starting,
-    required this.fps,
     required this.zoom,
     required this.pan,
     required this.bare,
     required this.onSize,
-    required this.onAck,
     required this.onScaleStart,
     required this.onScaleUpdate,
     required this.onTapUp,
   });
 
-  final ScreenFrame? frame;
+  /// The picture's size in px, or null while there is nothing to show.
+  final Size? pictureSize;
+
+  /// The picture, fitted (contained and centred) to whatever box it gets.
+  final Widget? picture;
+
+  /// The statistics line.
+  final String stats;
   final bool starting;
-  final int fps;
   final double zoom;
   final Offset pan;
 
   /// Edge to edge, with no frame or frame statistics, for full screen.
   final bool bare;
   final ValueChanged<Size> onSize;
-  final ValueChanged<int> onAck;
   final GestureScaleStartCallback onScaleStart;
   final GestureScaleUpdateCallback onScaleUpdate;
   final GestureTapUpCallback onTapUp;
@@ -587,8 +812,8 @@ class _Viewer extends StatelessWidget {
         child: LayoutBuilder(
           builder: (context, constraints) {
             onSize(constraints.biggest);
-            final f = frame;
-            if (f == null) {
+            final image = picture;
+            if (image == null || pictureSize == null) {
               return Center(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
@@ -613,20 +838,7 @@ class _Viewer extends StatelessWidget {
                     transform: Matrix4.identity()
                       ..translateByDouble(pan.dx, pan.dy, 0, 1)
                       ..scaleByDouble(zoom, zoom, 1, 1),
-                    child: Image.memory(
-                      f.bytes,
-                      gaplessPlayback: true,
-                      fit: BoxFit.contain,
-                      filterQuality: FilterQuality.medium,
-                      frameBuilder: (context, child, frameNumber, sync) {
-                        if (frameNumber != null || sync) onAck(f.seq);
-                        return child;
-                      },
-                      errorBuilder: (context, error, stack) {
-                        onAck(f.seq);
-                        return const SizedBox.shrink();
-                      },
-                    ),
+                    child: image,
                   ),
                   if (!bare)
                     Positioned(
@@ -635,7 +847,7 @@ class _Viewer extends StatelessWidget {
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                       decoration: BoxDecoration(color: t.bgDeep.withValues(alpha: 0.8), borderRadius: BorderRadius.circular(8)),
-                      child: Text("${f.width}×${f.height} · $fps fps${zoom > 1.01 ? " · ${zoom.toStringAsFixed(1)}×" : ""}", style: Theme.of(context).textTheme.labelSmall?.copyWith(color: t.textBright, fontSize: 11)),
+                      child: Text(stats, style: Theme.of(context).textTheme.labelSmall?.copyWith(color: t.textBright, fontSize: 11)),
                     ),
                   ),
                 ],
@@ -643,6 +855,48 @@ class _Viewer extends StatelessWidget {
             );
           },
         ),
+      ),
+    );
+  }
+}
+
+/// A video texture fitted like `BoxFit.contain`. When the texture holds more than the picture (decoders work in
+/// 16-px blocks, and not every renderer applies the crop), the texture is enlarged and shifted so that only the
+/// picture shows.
+class _VideoView extends StatelessWidget {
+  const _VideoView({required this.textureId, required this.picture, required this.size});
+
+  final int textureId;
+  final VideoPicture? picture;
+
+  /// The stream's picture size, used until the decoder reports its own.
+  final Size? size;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = picture;
+    final width = p?.width.toDouble() ?? size?.width ?? 16;
+    final height = p?.height.toDouble() ?? size?.height ?? 9;
+    final texture = Texture(textureId: textureId, filterQuality: FilterQuality.medium);
+    return Center(
+      child: AspectRatio(
+        aspectRatio: width / height,
+        child: p == null || !p.cropped
+            ? texture
+            : ClipRect(
+                child: LayoutBuilder(
+                  builder: (context, box) {
+                    final sx = box.maxWidth / p.width;
+                    final sy = box.maxHeight / p.height;
+                    return Stack(
+                      clipBehavior: Clip.hardEdge,
+                      children: [
+                        Positioned(left: -p.cropLeft * sx, top: -p.cropTop * sy, width: p.textureWidth * sx, height: p.textureHeight * sy, child: texture),
+                      ],
+                    );
+                  },
+                ),
+              ),
       ),
     );
   }

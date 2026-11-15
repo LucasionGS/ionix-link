@@ -33,6 +33,7 @@ optdepends=(
     'wl-clipboard: clipboard push and pull'
     'wtype: typing from the phone keyboard'
     'grim: screen view'
+    'wf-recorder: video in the screen view (H.264)'
     'hyprland: list monitors for the screen view'
     'wlr-randr: list monitors on other wlroots compositors'
     'imagemagick: cover art and the wallpaper on the phone (ffmpeg works too)'

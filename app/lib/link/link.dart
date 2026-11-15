@@ -25,3 +25,4 @@ export "plugins/theme_client.dart";
 export "protocol/constants.dart" show LinkProtocol, LinkPlugins;
 export "protocol/errors.dart";
 export "store/link_store.dart" show LinkStore, LinkKeyStore, SecureKeyStore, MemoryKeyStore;
+export "plugins/h264.dart";

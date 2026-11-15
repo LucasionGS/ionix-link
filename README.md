@@ -68,7 +68,7 @@ flutter build apk
 
 ## Technical bits
 
-- The desktop side is one Python file with no dependencies beyond the standard library, `bin/ionix-link`. It uses tools the desktop already has: `playerctl`, `wpctl`, `wl-clipboard`, `wtype`, `grim`, `busctl`. A feature whose tool is missing is simply not offered.
+- The desktop side is one Python file with no dependencies beyond the standard library, `bin/ionix-link`. It uses tools the desktop already has: `playerctl`, `wpctl`, `wl-clipboard`, `wtype`, `grim`, `wf-recorder`, `busctl`. A feature whose tool is missing is simply not offered.
 - TCP and UDP port 47110. TLS with a self-signed certificate the phone pins when pairing, and an HMAC challenge on every connection. The wire format is in [PROTOCOL.md](PROTOCOL.md), the code layout in [STRUCTURE.md](STRUCTURE.md).
 - Paired phones and the certificate live in `~/.local/share/ionix/link/`. The daemon writes `~/.local/state/ionix/link/state.json` for the desktop shell to read.
 - The app is Flutter, Android first. It also builds for Linux, which is how its screens are previewed headless: `flutter build linux -t lib/ui/preview/preview_main.dart`.

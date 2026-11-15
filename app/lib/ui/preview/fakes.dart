@@ -227,7 +227,7 @@ class FakeScreenSource extends ScreenSource {
       ];
 
   @override
-  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15}) async {
+  Future<ScreenStreamInfo> start(String output, {double scale = 0.5, int quality = 60, int maxFps = 15, String format = ScreenClient.formatJpeg}) async {
     starts++;
     final info = ScreenStreamInfo(output: output, width: 1280, height: 720);
     stream.value = info;
@@ -247,6 +247,13 @@ class FakeScreenSource extends ScreenSource {
 
   @override
   Stream<ScreenFrame> get frames => _frames.stream;
+
+  // The preview has no decoder to show video with.
+  @override
+  bool get canVideo => false;
+
+  @override
+  Stream<ScreenVideoUnit> get video => const Stream.empty();
 
   @override
   Stream<String> get stopped => const Stream.empty();

@@ -121,4 +121,10 @@ class FallbackPlatform extends LinkPlatform {
 
   @override
   Future<void> clearStagedFiles() async {}
+
+  @override
+  Future<bool> canDecodeH264() async => false;
+
+  @override
+  Future<VideoDecoder> createH264Decoder() => Future.error(UnsupportedError("Video decoding is only available on Android."));
 }
